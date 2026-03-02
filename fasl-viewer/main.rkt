@@ -202,7 +202,7 @@
                      [search-origin (app-cursor a)])]
        ;; Next/prev match
        [(key-msg #\n _ _) (find-next a)]
-       [(key-msg #\N _ _) (find-prev a)]
+       [(key-msg (or #\N #\p) _ _) (find-prev a)]
        ;; Move down
        [(key-msg (or #\j 'down) _ _) (move-cursor a 1)]
        ;; Move up
