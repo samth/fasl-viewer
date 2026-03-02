@@ -231,6 +231,92 @@
   (check-equal? (- cursor-col scroll-col) (- cursor-exp scroll-exp)))
 
 ;; -------------------------------------------------------------------
+;; Fasl inner info tests
+
+(test-case "fasl objects have inner-info parsed"
+  (define pf (parse-file petite-fasl-path))
+  (define boot (parsed-file-data pf))
+  (define objects (chez-boot-file-objects boot))
+  (define with-info (filter fasl-object-inner-info objects))
+  (check-true (> (length with-info) 0) "should parse inner-info for some objects"))
+
+(test-case "fasl inner info identifies closure type"
+  (define pf (parse-file petite-fasl-path))
+  (define boot (parsed-file-data pf))
+  (define objects (chez-boot-file-objects boot))
+  (define closures
+    (filter (lambda (obj)
+              (define inner (fasl-object-inner-info obj))
+              (and inner (eq? 'closure (fasl-inner-info-type inner))))
+            objects))
+  (check-true (> (length closures) 0) "should find closure objects"))
+
+(test-case "fasl inner info identifies immediate type"
+  (define pf (parse-file petite-fasl-path))
+  (define boot (parsed-file-data pf))
+  (define objects (chez-boot-file-objects boot))
+  (define immediates
+    (filter (lambda (obj)
+              (define inner (fasl-object-inner-info obj))
+              (and inner (eq? 'immediate (fasl-inner-info-type inner))))
+            objects))
+  (check-true (> (length immediates) 0) "should find immediate objects"))
+
+(test-case "fasl inner info shows graph counts"
+  (define pf (parse-file petite-fasl-path))
+  (define boot (parsed-file-data pf))
+  (define objects (chez-boot-file-objects boot))
+  (define with-graph
+    (filter (lambda (obj)
+              (define inner (fasl-object-inner-info obj))
+              (and inner (fasl-inner-info-graph-count inner)))
+            objects))
+  (check-true (> (length with-graph) 0) "should find objects with graph headers"))
+
+(test-case "fasl objects show inner type in label"
+  (define pf (parse-file petite-fasl-path))
+  (define tree (build-tree pf))
+  (define root-id (tnode-id (first tree)))
+  (define items (flatten-tree tree (seteq root-id)))
+  (check-true (ormap (lambda (item)
+                       (regexp-match? #rx"\\[closure\\]" (flat-item-label item)))
+                     items)
+              "should show [closure] in object labels"))
+
+(test-case "fasl objects with graph info are expandable"
+  (define pf (parse-file petite-fasl-path))
+  (define tree (build-tree pf))
+  (define root-id (tnode-id (first tree)))
+  (define items (flatten-tree tree (seteq root-id)))
+  (define expandable-fasl
+    (filter (lambda (item)
+              (and (flat-item-expandable? item)
+                   (regexp-match? #rx"\\[(closure|code|record)" (flat-item-label item))))
+            items))
+  (check-true (> (length expandable-fasl) 0)
+              "fasl objects with graph info should be expandable"))
+
+(test-case "expanding fasl object shows graph details"
+  (define pf (parse-file petite-fasl-path))
+  (define tree (build-tree pf))
+  (define root-id (tnode-id (first tree)))
+  (define items1 (flatten-tree tree (seteq root-id)))
+  ;; Find first expandable fasl object with [closure]
+  (define fasl-item
+    (for/or ([item (in-list items1)])
+      (and (flat-item-expandable? item)
+           (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
+           item)))
+  (check-not-false fasl-item "should find an expandable closure object")
+  ;; Expand it
+  (define expanded (seteq root-id (flat-item-id fasl-item)))
+  (define items2 (flatten-tree tree expanded))
+  (define detail-lines (filter flat-item-is-detail? items2))
+  (check-true (> (length detail-lines) 0) "should have detail lines")
+  (check-true (ormap (lambda (d) (string-contains? (flat-item-label d) "graph:")) detail-lines)
+              "detail should mention graph"))
+
+;; -------------------------------------------------------------------
 ;; Independent expansion across boot files
 
 (test-case "expanding object in one boot file does not affect others"

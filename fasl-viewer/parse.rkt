@@ -23,7 +23,8 @@
          (struct-out racket-executable)
          (struct-out racket-boot-entry)
          (struct-out zo-file)
-         (struct-out unknown-file))
+         (struct-out unknown-file)
+         (struct-out fasl-inner-info))
 
 ;; Top-level result
 (struct parsed-file (path format data) #:transparent)
@@ -36,7 +37,7 @@
 
 ;; A single fasl object (visit/revisit block)
 (struct fasl-object (index situation compression compressed-size
-                     uncompressed-size kind vfasl-hdr content-type)
+                     uncompressed-size kind vfasl-hdr content-type inner-info)
   #:transparent)
 
 ;; Parsed vfasl header (14 uptr fields on 64-bit = 112 bytes)
@@ -242,6 +243,142 @@
         n*)))
 
 ;; -------------------------------------------------------------------
+;; Fasl inner info: parse decompressed fasl payload for content details
+
+(struct fasl-inner-info (type name graph-count graph-external) #:transparent)
+
+(define (decode-immediate val)
+  (cond
+    [(= val 6) "#f"]
+    [(= val 14) "#t"]
+    [(= val 22) "()"]
+    [(= val 62) "void"]
+    [(= val 86) "eof"]
+    [else (format "imm(~a)" val)]))
+
+(define (read-fasl-string-value in)
+  (define len (read-uptr in))
+  (list->string
+   (for/list ([_ (in-range len)])
+     (integer->char (read-uptr in)))))
+
+(define (read-fasl-name in)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define tb (read-byte in))
+    (cond
+      [(eof-object? tb) #f]
+      [(= tb 2) ; symbol
+       (read-fasl-string-value in)]
+      [(= tb 9) ; string
+       (read-fasl-string-value in)]
+      [(= tb 19) ; gensym
+       (define pname (read-fasl-string-value in))
+       (read-fasl-string-value in) ; skip uname
+       pname]
+      [(= tb 12) ; immediate
+       (define val (read-uptr in))
+       (define decoded (decode-immediate val))
+       (if (equal? decoded "#f") #f decoded)]
+      [(= tb 17) ; graph-def
+       (read-uptr in)
+       (read-fasl-name in)]
+      [(= tb 18) ; graph-ref
+       (read-uptr in)
+       #f]
+      [else #f])))
+
+(define (read-code-name in)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (read-byte in) ; flags
+    (read-uptr in) ; free count
+    (define nbytes (read-uptr in))
+    (read-bytes nbytes in) ; skip code bytes
+    (read-fasl-name in)))
+
+(define (try-read-code-name in)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define tb (read-byte in))
+    (cond
+      [(eof-object? tb) #f]
+      [(= tb 17) ; graph-def
+       (read-uptr in)
+       (try-read-code-name in)]
+      [(= tb 11) ; code
+       (read-code-name in)]
+      [else #f])))
+
+(define (try-read-rtd-name in)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define tb (read-byte in))
+    (cond
+      [(eof-object? tb) #f]
+      [(= tb 25) ; rtd — first sub-fasl is uid
+       (read-fasl-name in)]
+      [(= tb 27) ; base-rtd
+       "$base-rtd"]
+      [(= tb 17) ; graph-def
+       (read-uptr in)
+       (try-read-rtd-name in)]
+      [(= tb 18) ; graph-ref
+       (read-uptr in)
+       #f]
+      [else #f])))
+
+(define (parse-fasl-inner-info data)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define in (open-input-bytes data))
+    (define first-byte (read-byte in))
+    (when (eof-object? first-byte) (error "empty fasl"))
+    ;; Handle graph wrapper
+    (define-values (gc ge tb)
+      (cond
+        [(= first-byte 16) ; graph
+         (define gc (read-uptr in))
+         (define ge (read-uptr in))
+         (define b (read-byte in))
+         (when (eof-object? b) (error "eof after graph header"))
+         (values gc ge b)]
+        [else (values #f #f first-byte)]))
+    ;; Handle graph-def wrapper on top-level type
+    (define actual-byte
+      (cond
+        [(= tb 17) ; graph-def
+         (read-uptr in)
+         (define b (read-byte in))
+         (when (eof-object? b) (error "eof after graph-def"))
+         b]
+        [else tb]))
+    ;; Parse by type
+    (define-values (type name)
+      (cond
+        [(= actual-byte 6) ; closure
+         (read-uptr in) ; offset
+         (values 'closure (try-read-code-name in))]
+        [(= actual-byte 11) ; code
+         (values 'code (read-code-name in))]
+        [(= actual-byte 24) ; record
+         (read-uptr in) ; nflds
+         (values 'record (try-read-rtd-name in))]
+        [(= actual-byte 43) ; begin
+         (define count (read-uptr in))
+         (values 'begin (number->string count))]
+        [(= actual-byte 13) ; entry
+         (read-uptr in)
+         (values 'entry #f)]
+        [(= actual-byte 14) ; library
+         (read-uptr in)
+         (values 'library #f)]
+        [(= actual-byte 15) ; library-code
+         (read-uptr in)
+         (values 'library-code #f)]
+        [(= actual-byte 12) ; immediate
+         (define val (read-uptr in))
+         (values 'immediate (decode-immediate val))]
+        [else
+         (values (string->symbol (lookup-fasl-content-type actual-byte)) #f)]))
+    (fasl-inner-info type name gc ge)))
+
+;; -------------------------------------------------------------------
 ;; Top-level dispatcher
 
 (define (parse-file path)
@@ -341,7 +478,7 @@
            [(101) 'vfasl]
            [else (format "unknown(~a)" kind-byte)]))
 
-       (define-values (compressed-size uncompressed-size vhdr ctype)
+       (define-values (compressed-size uncompressed-size vhdr ctype inner)
          (case comp-byte
            [(45 46) ; gzip or lz4
             (define usize (read-uptr in))
@@ -351,35 +488,45 @@
               [(= kind-byte 101) ; vfasl
                (define vh (parse-vfasl-header-from-compressed
                            in comp-byte csize usize current-mt))
-               (values csize usize vh #f)]
+               (values csize usize vh #f #f)]
               [else
-               ;; For fasl, peek at first content byte from compressed data
-               (define save-pos (file-position in))
+               ;; Decompress fasl payload and parse inner info
                (define compressed-data (read-bytes csize in))
-               (file-position in save-pos)
-               (define ct
+               (define decompressed
                  (and (bytes? compressed-data)
-                      (= comp-byte 46) ; LZ4 only
-                      (lz4-peek-first-byte compressed-data)))
-               (values csize usize #f ct)])]
+                      (with-handlers ([exn:fail? (lambda (e) #f)])
+                        (cond
+                          [(= comp-byte 46) (lz4-decompress compressed-data usize)]
+                          [(= comp-byte 45) (gzip-decompress compressed-data)]
+                          [else compressed-data]))))
+               (define ct
+                 (and (bytes? decompressed)
+                      (> (bytes-length decompressed) 0)
+                      (bytes-ref decompressed 0)))
+               (define ii (and (bytes? decompressed) (parse-fasl-inner-info decompressed)))
+               (values csize usize #f ct ii)])]
            [(44) ; uncompressed
             (define remaining (- size 2))
             (cond
               [(= kind-byte 101)
                (define vh (parse-vfasl-header-inline in current-mt))
-               (values remaining remaining vh #f)]
+               (values remaining remaining vh #f #f)]
               [else
-               ;; Peek at the first byte of fasl content
-               (define ct (read-byte in))
-               (values remaining remaining #f
-                       (if (eof-object? ct) #f ct))])]
-           [else (values (- size 2) (- size 2) #f #f)]))
+               ;; Read fasl payload and parse inner info
+               (define data (read-bytes remaining in))
+               (define ct
+                 (and (bytes? data)
+                      (> (bytes-length data) 0)
+                      (bytes-ref data 0)))
+               (define ii (and (bytes? data) (parse-fasl-inner-info data)))
+               (values remaining remaining #f ct ii)])]
+           [else (values (- size 2) (- size 2) #f #f #f)]))
 
        (set!
         objects
         (cons
          (fasl-object obj-index situation compression
-                      compressed-size uncompressed-size kind vhdr ctype)
+                      compressed-size uncompressed-size kind vhdr ctype inner)
          objects))
        (set! obj-index (add1 obj-index))
        ;; Skip to end of this object

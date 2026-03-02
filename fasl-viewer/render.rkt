@@ -122,6 +122,25 @@
      object-children)
     #t)))
 
+(define (inner-info->bracket-text inner)
+  (define type (fasl-inner-info-type inner))
+  (define name (fasl-inner-info-name inner))
+  (define name? (and name (not (equal? name ""))))
+  (cond
+    [(and (eq? type 'immediate) name) name]
+    [(and (eq? type 'begin) name) (format "begin(~a)" name)]
+    [(and name? (memq type '(code closure)))
+     (format "~a ~s" type name)]
+    [name? (format "~a ~a" type name)]
+    [else (format "~a" type)]))
+
+(define (build-fasl-inner-details inner)
+  (define gc (fasl-inner-info-graph-count inner))
+  (define ge (fasl-inner-info-graph-external inner))
+  (if (and gc ge)
+      (list (format "graph: ~a entries, ~a external" gc ge))
+      '()))
+
 (define (build-object-node obj [prefix ""])
   (define idx (fasl-object-index obj))
   (define sit (fasl-object-situation obj))
@@ -131,6 +150,7 @@
   (define usize (fasl-object-uncompressed-size obj))
   (define ct (fasl-object-content-type obj))
   (define vh (fasl-object-vfasl-hdr obj))
+  (define inner (fasl-object-inner-info obj))
 
   (define size-str
     (cond
@@ -139,6 +159,7 @@
 
   (define type-str
     (cond
+      [inner (inner-info->bracket-text inner)]
       [ct (lookup-fasl-content-type ct)]
       [vh "vfasl"]
       [else ""]))
@@ -157,6 +178,7 @@
   (define details
     (cond
       [vh (build-vfasl-details vh)]
+      [inner (build-fasl-inner-details inner)]
       [else '()]))
 
   (tnode (string->symbol (string-append prefix (format "o~a" idx))) label details '() (pair? details)))
