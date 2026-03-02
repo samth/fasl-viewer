@@ -290,7 +290,11 @@
 
 (define comp-colors (hasheq 'uncompressed fg-bright-black 'lz4 fg-green 'gzip fg-yellow))
 
-(define (render-view items cursor scroll width height file-path total-items)
+(define search-style (make-style #:bold #t))
+
+(define (render-view items cursor scroll width height file-path total-items
+                     #:search-mode? [search-mode? #f]
+                     #:search-query [search-query ""])
   (define content-height (- height 2)) ; header + footer
   (define visible
     (take (drop items (min scroll (length items)))
@@ -315,14 +319,21 @@
   (define pad-imgs (make-list pad-count (text "")))
 
   ;; Footer bar
-  (define pct
-    (if (<= total-items 0)
-        100
-        (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
-  (define footer-text
-    (format " ~a/~a  ~a%%  [j/k]move [enter]expand [q]quit " (add1 cursor) total-items pct))
-  (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
-  (define footer-img (styled footer-style (text (string-append footer-text footer-pad))))
+  (define footer-img
+    (cond
+      [search-mode?
+       (define search-text (format "/~a" search-query))
+       (define pad (make-string (max 0 (- width (string-length search-text))) #\space))
+       (styled search-style (text (string-append search-text pad)))]
+      [else
+       (define pct
+         (if (<= total-items 0)
+             100
+             (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
+       (define footer-text
+         (format " ~a/~a  ~a%%  [j/k]move [/]search [q]quit " (add1 cursor) total-items pct))
+       (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
+       (styled footer-style (text (string-append footer-text footer-pad)))]))
 
   (apply vcat 'left header-img (append line-imgs pad-imgs (list footer-img))))
 

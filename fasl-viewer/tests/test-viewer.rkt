@@ -317,6 +317,117 @@
               "detail should mention graph"))
 
 ;; -------------------------------------------------------------------
+;; Search tests
+
+(test-case "/ enters search mode"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (test-program-press tp #\/)
+  (define a (test-program-value tp))
+  (check-true (app-search-mode? a))
+  (check-equal? (app-search-query a) ""))
+
+(test-case "search jumps to matching item"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (test-program-press tp #\/)    ; enter search
+  (for ([c (in-string "record")])
+    (test-program-press tp c))
+  (define a (test-program-value tp))
+  (check-true (app-search-mode? a))
+  ;; Should have jumped to first [record] item
+  (define item (list-ref (app-items a) (app-cursor a)))
+  (check-regexp-match #rx"[Rr]ecord" (flat-item-label item)))
+
+(test-case "enter confirms search, escape cancels"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (define cursor-before (app-cursor (test-program-value tp)))
+  (test-program-press tp #\/)
+  (for ([c (in-string "record")])
+    (test-program-press tp c))
+  ;; Confirm with enter
+  (test-program-press tp 'enter)
+  (define a1 (test-program-value tp))
+  (check-false (app-search-mode? a1))
+  (check-not-equal? (app-cursor a1) cursor-before "cursor should have moved")
+
+  ;; Now search again and cancel with escape
+  (define cursor-after-confirm (app-cursor a1))
+  (test-program-press tp #\/)
+  (for ([c (in-string "code")])
+    (test-program-press tp c))
+  (test-program-press tp 'escape)
+  (define a2 (test-program-value tp))
+  (check-false (app-search-mode? a2))
+  (check-equal? (app-cursor a2) cursor-after-confirm "escape should restore cursor"))
+
+(test-case "n finds next match, N finds previous"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  ;; Search for "record"
+  (test-program-press tp #\/)
+  (for ([c (in-string "record")])
+    (test-program-press tp c))
+  (test-program-press tp 'enter) ; confirm
+  (define a1 (test-program-value tp))
+  (define first-match (app-cursor a1))
+
+  ;; n should find next match
+  (test-program-press tp #\n)
+  (define a2 (test-program-value tp))
+  (check-true (> (app-cursor a2) first-match) "n should move forward")
+  (check-regexp-match #rx"[Rr]ecord"
+                      (flat-item-label (list-ref (app-items a2) (app-cursor a2))))
+
+  ;; N should find previous match
+  (test-program-press tp #\N)
+  (define a3 (test-program-value tp))
+  (check-equal? (app-cursor a3) first-match "N should go back to first match"))
+
+(test-case "search bar appears in view"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp #\/)
+  (for ([c (in-string "test")])
+    (test-program-press tp c))
+  (check-test-program-contains tp "/test"))
+
+;; -------------------------------------------------------------------
 ;; Independent expansion across boot files
 
 (test-case "expanding object in one boot file does not affect others"
