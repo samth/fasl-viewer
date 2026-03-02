@@ -1,0 +1,342 @@
+#lang racket/base
+
+;; render.rkt — Build a tree of nodes from parsed data, and render
+;; visible lines as kettle images with colors and box-drawing.
+
+(require racket/string
+         racket/format
+         racket/list
+         racket/match
+         racket/set
+         kettle
+         "parse.rkt")
+
+(provide build-tree
+         flatten-tree
+         render-view
+
+         ;; Tree node structure
+         (struct-out tnode)
+         (struct-out flat-item))
+
+;; A tree node: id, label, optional detail lines, children, expandable flag
+(struct tnode (id label details children expandable?) #:transparent)
+
+;; Vspace names corresponding to the enumeration in cmacros.ss
+(define vspace-names
+  #("symbol" "rtd" "closure" "impure" "pure-typed" "impure-record" "code" "data" "reloc"))
+
+(define vspace-colors
+  (vector fg-magenta
+          fg-red
+          fg-green
+          fg-yellow
+          fg-blue
+          fg-bright-red
+          fg-cyan
+          fg-bright-yellow
+          fg-bright-black))
+
+(define (format-bytes n)
+  (cond
+    [(>= n (* 1024 1024)) (format "~a MB" (~r (/ n (* 1024.0 1024)) #:precision '(= 1)))]
+    [(>= n 1024) (format "~a KB" (~r (/ n 1024.0) #:precision '(= 1)))]
+    [else (format "~a B" n)]))
+
+;; -------------------------------------------------------------------
+;; Build tree from parsed file
+
+(define (build-tree pf)
+  (define data (parsed-file-data pf))
+  (define basename
+    (let ([p (parsed-file-path pf)])
+      (define parts (regexp-split #rx"/" p))
+      (last parts)))
+  (cond
+    [(chez-boot-file? data) (build-chez-tree basename data)]
+    [(racket-executable? data) (build-exe-tree basename data)]
+    [(zo-file? data) (build-zo-tree basename data)]
+    [(unknown-file? data) (list (tnode 'root (format "~a  (unknown format)" basename) '() '() #f))]))
+
+(define (build-chez-tree name boot [prefix ""])
+  (define headers (chez-boot-file-headers boot))
+  (define objects (chez-boot-file-objects boot))
+  (define first-hdr (and (pair? headers) (first headers)))
+  (define version-str
+    (if first-hdr
+        (format-scheme-version (boot-header-version first-hdr))
+        "?"))
+  (define machine-str
+    (if first-hdr
+        (lookup-machine-type (boot-header-machine-type first-hdr))
+        "?"))
+
+  (define (make-id s) (string->symbol (string-append prefix s)))
+
+  ;; Build header children (deduplicated — repeated headers are concatenation artifacts)
+  (define seen-headers (make-hash))
+  (define header-children
+    (filter
+     values
+     (for/list ([h (in-list headers)]
+                [i (in-naturals)])
+       (define deps (boot-header-dependencies h))
+       (define mt-num (boot-header-machine-type h))
+       (define ver (boot-header-version h))
+       (define key (list mt-num ver deps))
+       (cond
+         [(hash-ref seen-headers key #f) #f]
+         [else
+          (hash-set! seen-headers key #t)
+          (define mt (lookup-machine-type mt-num))
+          (tnode (make-id (format "h~a" i))
+                 (format "~a  v~a~a"
+                         mt
+                         (format-scheme-version ver)
+                         (if (string=? deps "")
+                             ""
+                             (format "  deps=(~a)" deps)))
+                 '()
+                 '()
+                 #f)]))))
+
+  ;; Build object children
+  (define object-children
+    (for/list ([obj (in-list objects)])
+      (build-object-node obj prefix)))
+
+  (list
+   (tnode
+    (make-id "headers")
+    (format "~a  (~a, v~a, ~a headers, ~a objects)"
+            name
+            machine-str
+            version-str
+            (length headers)
+            (length objects))
+    '()
+    (append
+     (if (pair? header-children)
+         (list (tnode (make-id "hdr-group") (format "Headers (~a)" (length headers)) '() header-children #t))
+         '())
+     object-children)
+    #t)))
+
+(define (build-object-node obj [prefix ""])
+  (define idx (fasl-object-index obj))
+  (define sit (fasl-object-situation obj))
+  (define comp (fasl-object-compression obj))
+  (define kind (fasl-object-kind obj))
+  (define csize (fasl-object-compressed-size obj))
+  (define usize (fasl-object-uncompressed-size obj))
+  (define ct (fasl-object-content-type obj))
+  (define vh (fasl-object-vfasl-hdr obj))
+
+  (define size-str
+    (cond
+      [(equal? comp 'uncompressed) (format-bytes usize)]
+      [else (format "~a -> ~a" (format-bytes csize) (format-bytes usize))]))
+
+  (define type-str
+    (cond
+      [ct (lookup-fasl-content-type ct)]
+      [vh "vfasl"]
+      [else ""]))
+
+  (define label
+    (format "~a  ~a  ~a  ~a~a"
+            sit
+            comp
+            kind
+            size-str
+            (if (string=? type-str "")
+                ""
+                (format "  [~a]" type-str))))
+
+  ;; Build detail lines for expanded view
+  (define details
+    (cond
+      [vh (build-vfasl-details vh)]
+      [else '()]))
+
+  (tnode (string->symbol (string-append prefix (format "o~a" idx))) label details '() (pair? details)))
+
+(define (build-vfasl-details vh)
+  (define data-size (vfasl-header-data-size vh))
+  (define rel-offsets (vfasl-header-vspace-offsets vh))
+  (define all-starts (cons 0 (append rel-offsets (list data-size))))
+
+  (append (list (format "data: ~a  table: ~a  result-offset: ~a"
+                        (format-bytes data-size)
+                        (format-bytes (vfasl-header-table-size vh))
+                        (vfasl-header-result-offset vh))
+                (format "symrefs: ~a  rtdrefs: ~a  singletonrefs: ~a"
+                        (vfasl-header-symref-count vh)
+                        (vfasl-header-rtdref-count vh)
+                        (vfasl-header-singletonref-count vh)))
+          (for/list ([i (in-range (min (vector-length vspace-names) (sub1 (length all-starts))))]
+                     #:when (< (add1 i) (length all-starts)))
+            (define sz (- (list-ref all-starts (add1 i)) (list-ref all-starts i)))
+            (define pct
+              (if (> data-size 0)
+                  (~r (* 100.0 (/ sz data-size)) #:precision '(= 1))
+                  "0.0"))
+            (format "~a ~a  ~a%"
+                    (~a #:min-width 14 #:align 'left (vector-ref vspace-names i))
+                    (~a #:min-width 10 #:align 'right (format-bytes sz))
+                    (~a #:min-width 5 #:align 'right pct)))))
+
+;; -------------------------------------------------------------------
+;; Racket executable tree
+
+(define (build-exe-tree name exe)
+  (define boots (racket-executable-boot-files exe))
+  (define boot-names '("petite.boot" "scheme.boot" "racket.boot"))
+  (define boot-children
+    (for/list ([entry (in-list boots)]
+               [bname (in-list boot-names)]
+               [i (in-naturals)])
+      (define inner (build-chez-tree bname (racket-boot-entry-boot entry) (format "boot~a/" i)))
+      ;; Merge the inner chez root into the exe boot entry: use the chez root's
+      ;; label (which has machine/version/counts) and its children directly,
+      ;; adding offset/size info.
+      (define chez-root (first inner))
+      (tnode (string->symbol (format "boot~a" i))
+             (format "~a  offset ~a, ~a"
+                     (tnode-label chez-root)
+                     (racket-boot-entry-offset entry)
+                     (format-bytes (racket-boot-entry-size entry)))
+             (tnode-details chez-root)
+             (tnode-children chez-root)
+             (tnode-expandable? chez-root))))
+
+  (list (tnode 'root
+               (format "~a  (.rackboot ~a at offset ~a)"
+                       name
+                       (format-bytes (racket-executable-section-size exe))
+                       (racket-executable-section-offset exe))
+               '()
+               boot-children
+               #t)))
+
+;; -------------------------------------------------------------------
+;; .zo tree
+
+(define (build-zo-tree name zo)
+  (list (tnode 'root
+               (format "~a  (Racket .zo)" name)
+               (list (format "version: ~a" (zo-file-version zo))
+                     (format "machine: ~a" (zo-file-machine-type zo))
+                     (format "tag: ~a" (zo-file-tag zo))
+                     ""
+                     "(Full linklet bundle parsing not yet implemented)")
+               '()
+               #t)))
+
+;; -------------------------------------------------------------------
+;; Flatten tree into visible lines
+
+;; A flat-item is one visible line in the display
+(struct flat-item (id depth label expandable? expanded? is-detail?) #:transparent)
+
+(define (flatten-tree nodes expanded [depth 0])
+  (apply append
+         (for/list ([n (in-list nodes)])
+           (define id (tnode-id n))
+           (define exp? (set-member? expanded id))
+           (cons (flat-item id depth (tnode-label n) (tnode-expandable? n) exp? #f)
+                 (if exp?
+                     ;; Detail lines
+                     (append (for/list ([d (in-list (tnode-details n))])
+                               (flat-item #f (add1 depth) d #f #f #t))
+                             ;; Children
+                             (flatten-tree (tnode-children n) expanded (add1 depth)))
+                     '())))))
+
+;; -------------------------------------------------------------------
+;; Render the visible portion as a kettle image
+
+(define header-style (make-style #:bold #t #:reverse #t))
+(define footer-style (make-style #:bold #t #:reverse #t))
+(define cursor-style (make-style #:reverse #t))
+(define detail-style (make-style #:foreground fg-bright-black))
+(define index-style (make-style #:foreground fg-bright-black #:bold #t))
+
+(define kind-colors (hasheq 'fasl fg-blue 'vfasl fg-magenta))
+
+(define sit-colors (hasheq 'visit fg-green 'revisit fg-yellow 'visit-revisit fg-cyan))
+
+(define comp-colors (hasheq 'uncompressed fg-bright-black 'lz4 fg-green 'gzip fg-yellow))
+
+(define (render-view items cursor scroll width height file-path total-items)
+  (define content-height (- height 2)) ; header + footer
+  (define visible
+    (take (drop items (min scroll (length items)))
+          (min content-height (max 0 (- (length items) scroll)))))
+
+  ;; Header bar
+  (define basename (let ([parts (regexp-split #rx"/" file-path)]) (last parts)))
+  (define hdr-text (format " ~a " basename))
+  (define hdr-pad (make-string (max 0 (- width (string-length hdr-text))) #\space))
+  (define header-img (styled header-style (text (string-append hdr-text hdr-pad))))
+
+  ;; Content lines
+  (define line-imgs
+    (for/list ([item (in-list visible)]
+               [vi (in-naturals)])
+      (define actual-idx (+ scroll vi))
+      (define at-cursor? (= actual-idx cursor))
+      (render-line item width at-cursor?)))
+
+  ;; Pad remaining lines
+  (define pad-count (max 0 (- content-height (length line-imgs))))
+  (define pad-imgs (make-list pad-count (text "")))
+
+  ;; Footer bar
+  (define pct
+    (if (<= total-items 0)
+        100
+        (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
+  (define footer-text
+    (format " ~a/~a  ~a%%  [j/k]move [enter]expand [q]quit " (add1 cursor) total-items pct))
+  (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
+  (define footer-img (styled footer-style (text (string-append footer-text footer-pad))))
+
+  (apply vcat 'left header-img (append line-imgs pad-imgs (list footer-img))))
+
+(define (render-line item width at-cursor?)
+  (match item
+    [(flat-item id depth label expandable? expanded? is-detail?)
+     (define indent (make-string (* depth 2) #\space))
+     (define arrow
+       (cond
+         [(not expandable?) "  "]
+         [expanded? "▾ "]
+         [else "▸ "]))
+     (define raw (string-append indent arrow label))
+     (define truncated
+       (if (> (string-length raw) width)
+           (string-append (substring raw 0 (max 0 (- width 1))) "~")
+           raw))
+     (define padded
+       (if (< (string-length truncated) width)
+           (string-append truncated (make-string (- width (string-length truncated)) #\space))
+           truncated))
+
+     (cond
+       [at-cursor? (styled cursor-style (text padded))]
+       [is-detail?
+        ;; Color vspace lines
+        (define vspace-match
+          (for/or ([i (in-range (vector-length vspace-names))])
+            (and (regexp-match? (regexp (string-append "^\\s*" (vector-ref vspace-names i) " "))
+                                label)
+                 i)))
+        (if vspace-match
+            (styled (make-style #:foreground (vector-ref vspace-colors vspace-match)) (text padded))
+            (styled detail-style (text padded)))]
+       ;; Color based on content for object lines
+       [(and (not is-detail?) (not expandable?) id)
+        ;; Leaf item (header entry etc) - dim
+        (styled (make-style #:foreground fg-bright-black) (text padded))]
+       [else (text padded)])]))
