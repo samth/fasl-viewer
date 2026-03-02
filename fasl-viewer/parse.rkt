@@ -291,8 +291,7 @@
   (with-handlers ([exn:fail? (lambda (e) #f)])
     (read-byte in) ; flags
     (read-uptr in) ; free count
-    (define nbytes (read-uptr in))
-    (read-bytes nbytes in) ; skip code bytes
+    (read-uptr in) ; nbytes (name comes before code bytes in fasl)
     (read-fasl-name in)))
 
 (define (try-read-code-name in)
