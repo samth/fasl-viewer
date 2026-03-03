@@ -358,7 +358,7 @@
   (define asm (and (>= (vector-length code) 8) (vector-ref code 7)))
   (cond
     [(and (pair? asm) (pair? (car asm)) (eq? (caar asm) '#%assembly-code))
-     (cdar asm)]
+     (filter (lambda (s) (and (string? s) (not (equal? s "")))) (cdar asm))]
     [(bytes? asm)
      (list (format "<~a bytes of machine code>" (bytes-length asm)))]
     [else '()]))

@@ -65,6 +65,9 @@
   (define new-cursor (max 0 (min (sub1 (length (app-items a))) (+ (app-cursor a) delta))))
   (ensure-visible (struct-copy app a [cursor new-cursor])))
 
+(define (fasl-object-id? id)
+  (and id (regexp-match? #rx"^(?:boot[0-9]+/)?o[0-9]+$" (symbol->string id))))
+
 (define (toggle-expand a)
   (define items (app-items a))
   (define cursor (app-cursor a))
@@ -79,8 +82,13 @@
         (define new-exp (set-remove (app-expanded a) id))
         (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))]
        [else
-        (define new-exp (set-add (app-expanded a) id))
-        (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))])]))
+        ;; When expanding a fasl/vfasl object node, auto-load description if not yet loaded
+        (cond
+          [(and (fasl-object-id? id) (not (hash-has-key? (app-descriptions a) id)))
+           (describe-and-expand a)]
+          [else
+           (define new-exp (set-add (app-expanded a) id))
+           (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))])])]))
 
 (define (expand-current a)
   (define items (app-items a))
@@ -92,8 +100,13 @@
     [(flat-item id _ _ expandable? expanded? _)
      (cond
        [(and expandable? (not expanded?))
-        (define new-exp (set-add (app-expanded a) id))
-        (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))]
+        ;; Auto-load description for fasl/vfasl objects
+        (cond
+          [(and (fasl-object-id? id) (not (hash-has-key? (app-descriptions a) id)))
+           (describe-and-expand a)]
+          [else
+           (define new-exp (set-add (app-expanded a) id))
+           (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))])]
        ;; If already expanded, move to first child
        [(and expandable? expanded? (< (add1 cursor) (length items))) (move-cursor a 1)]
        [else a])]))
@@ -196,38 +209,43 @@
 ;; -------------------------------------------------------------------
 ;; Describe (d key) — deep fasl inspection
 
-(define (describe-current a)
+(define (resolve-fasl-id a id)
+  ;; Returns (values boot-idx obj-idx) if id refers to a valid fasl/vfasl object, #f otherwise
+  (define id-str (symbol->string id))
+  (define m (regexp-match #rx"^(?:boot([0-9]+)/)?o([0-9]+)$" id-str))
+  (cond
+    [(not m) #f]
+    [else
+     (define boot-idx (and (second m) (string->number (second m))))
+     (define obj-idx (string->number (third m)))
+     (define pf-data (parsed-file-data (app-parsed a)))
+     (define objects
+       (cond
+         [boot-idx
+          (define entry (list-ref (racket-executable-boot-files pf-data) boot-idx))
+          (chez-boot-file-objects (racket-boot-entry-boot entry))]
+         [else
+          (chez-boot-file-objects pf-data)]))
+     (cond
+       [(>= obj-idx (length objects)) #f]
+       [(not (memq (fasl-object-kind (list-ref objects obj-idx)) '(fasl vfasl))) #f]
+       [else (list boot-idx obj-idx)])]))
+
+(define (describe-and-expand a)
+  ;; Called when expanding a fasl/vfasl object node that hasn't been described yet.
+  ;; Loads description (which also expands the node).
   (define items (app-items a))
   (define cursor (app-cursor a))
-  (when (>= cursor (length items)) (void))
   (define item (list-ref items cursor))
   (define id (flat-item-id item))
+  (define resolved (resolve-fasl-id a id))
   (cond
-    [(not id) a]
+    [resolved
+     (toggle-description-on a id (first resolved) (second resolved))]
     [else
-     (define id-str (symbol->string id))
-     (define m (regexp-match #rx"^(?:boot([0-9]+)/)?o([0-9]+)$" id-str))
-     (cond
-       [(not m) a]
-       [else
-        (define boot-idx (and (second m) (string->number (second m))))
-        (define obj-idx (string->number (third m)))
-        ;; Check that this is a fasl (not vfasl) object
-        (define pf-data (parsed-file-data (app-parsed a)))
-        (define objects
-          (cond
-            [boot-idx
-             (define entry (list-ref (racket-executable-boot-files pf-data) boot-idx))
-             (chez-boot-file-objects (racket-boot-entry-boot entry))]
-            [else
-             (chez-boot-file-objects pf-data)]))
-        (cond
-          [(>= obj-idx (length objects)) a]
-          [(not (memq (fasl-object-kind (list-ref objects obj-idx)) '(fasl vfasl))) a]
-          [(hash-has-key? (app-descriptions a) id)
-           (toggle-description-off a id)]
-          [else
-           (toggle-description-on a id boot-idx obj-idx)])])]))
+     ;; Fallback: normal expand
+     (define new-exp (set-add (app-expanded a) id))
+     (ensure-visible (rebuild-items (struct-copy app a [expanded new-exp])))]))
 
 (define (toggle-description-on a id boot-idx obj-idx)
   (define cache-key boot-idx)
@@ -369,8 +387,6 @@
        ;; Top / bottom
        [(key-msg #\g _ _) (goto-top a)]
        [(key-msg #\G _ _) (goto-bottom a)]
-       ;; Describe fasl entry
-       [(key-msg #\d _ #f) (describe-current a)]
        ;; Page down/up
        [(key-msg 'page-down _ _) (page-down a)]
        [(key-msg 'page-up _ _) (page-up a)]
@@ -383,14 +399,6 @@
     [(window-size-msg w h) (resize a w h)]
     [_ a]))
 
-(define (cursor-describable? a)
-  (define items (app-items a))
-  (define cursor (app-cursor a))
-  (and (< cursor (length items))
-       (let ([id (flat-item-id (list-ref items cursor))])
-         (and id
-              (regexp-match? #rx"^(?:boot[0-9]+/)?o[0-9]+$" (symbol->string id))))))
-
 (define (app-to-view a)
   (render-view (app-items a)
                (app-cursor a)
@@ -400,8 +408,7 @@
                (app-file-path a)
                (length (app-items a))
                #:search-mode? (app-search-mode? a)
-               #:search-query (app-search-query a)
-               #:cursor-describable? (cursor-describable? a)))
+               #:search-query (app-search-query a)))
 
 (module+ main
   (define file-path (command-line #:program "fasl-viewer" #:args (file) file))

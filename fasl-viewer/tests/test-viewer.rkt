@@ -5,6 +5,7 @@
          racket/list
          racket/string
          racket/hash
+         kettle
          kettle/test
          "../parse.rkt"
          "../render.rkt"
@@ -709,9 +710,9 @@
   (check-equal? (app-height a) 40))
 
 ;; -------------------------------------------------------------------
-;; Describe (d key) tests
+;; Describe-on-expand tests
 
-(test-case "d on fasl object loads description"
+(test-case "expanding fasl object auto-loads description"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -724,12 +725,12 @@
   (test-program-press tp 'enter)
   (test-program-press tp #\j) ; hdr-group
   (test-program-press tp #\j) ; o0
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter) ; expand — should auto-describe
   (define a (test-program-value tp))
   (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
   (check-true (set-member? (app-expanded a) 'o0) "o0 should be auto-expanded"))
 
-(test-case "d toggles description off"
+(test-case "collapse and re-expand fasl object reuses cached description"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -741,16 +742,22 @@
   (test-program-press tp 'enter)
   (test-program-press tp #\j)
   (test-program-press tp #\j)
-  ;; Toggle on
-  (test-program-press tp #\d)
+  ;; Expand (auto-describe)
+  (test-program-press tp 'enter)
   (define a1 (test-program-value tp))
   (check-true (hash-has-key? (app-descriptions a1) 'o0))
-  ;; Toggle off
-  (test-program-press tp #\d)
+  ;; Collapse
+  (test-program-press tp 'enter)
   (define a2 (test-program-value tp))
-  (check-false (hash-has-key? (app-descriptions a2) 'o0) "description should be removed"))
+  (check-false (set-member? (app-expanded a2) 'o0) "should be collapsed")
+  ;; Description stays in cache
+  (check-true (hash-has-key? (app-descriptions a2) 'o0) "description remains cached")
+  ;; Re-expand uses cached data (no re-load)
+  (test-program-press tp 'enter)
+  (define a3 (test-program-value tp))
+  (check-true (set-member? (app-expanded a3) 'o0) "should be re-expanded"))
 
-(test-case "d on vfasl object loads description"
+(test-case "expanding vfasl object auto-loads description"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -772,12 +779,12 @@
   ;; Navigate to it
   (for ([_ (in-range vfasl-idx)])
     (test-program-press tp #\j))
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter) ; expand — should auto-describe
   (define a (test-program-value tp))
   (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
   (check-true (set-member? (app-expanded a) id) "vfasl node should be expanded"))
 
-(test-case "d on vfasl procedure creates CODE children"
+(test-case "expanding vfasl procedure creates CODE children"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -797,10 +804,10 @@
   (check-true (>= (length vfasl-indices) 2) "should have at least 2 vfasl items")
   (define vfasl-idx (second vfasl-indices))
   (define id (flat-item-id (list-ref (app-items a0) vfasl-idx)))
-  ;; Navigate to it and press d
+  ;; Navigate to it and expand (auto-describe)
   (for ([_ (in-range vfasl-idx)])
     (test-program-press tp #\j))
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter)
   (define a1 (test-program-value tp))
   ;; Should have CODE children in the tree
   (define node-children (find-tnode-children (app-tree a1) id))
@@ -808,7 +815,7 @@
   (check-true (pair? node-children) "should have CODE children")
   (check-regexp-match #rx"^CODE" (tnode-label (first node-children))))
 
-(test-case "d on header node is no-op"
+(test-case "expanding header node does not trigger describe"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -819,11 +826,11 @@
                            #:height 40))
   (test-program-press tp 'enter)
   (test-program-press tp #\j) ; hdr-group
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter) ; expand hdr-group
   (define a (test-program-value tp))
-  (check-true (hash-empty? (app-descriptions a)) "d on header should be no-op"))
+  (check-true (hash-empty? (app-descriptions a)) "expanding header should not trigger describe"))
 
-(test-case "d on fasl closure creates CODE children"
+(test-case "expanding fasl closure creates CODE children"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -841,10 +848,10 @@
       (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
            i)))
   (check-not-false closure-idx "should find a closure object")
-  ;; Navigate to it and press d
+  ;; Navigate to it and expand (auto-describe)
   (for ([_ (in-range closure-idx)])
     (test-program-press tp #\j))
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter)
   (define a1 (test-program-value tp))
   (define id (flat-item-id (list-ref (app-items a0) closure-idx)))
   ;; Should have CODE children in the tree
@@ -872,10 +879,10 @@
       (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
            i)))
   (check-not-false closure-idx)
-  ;; Navigate to closure and press d
+  ;; Navigate to closure and expand (auto-describe)
   (for ([_ (in-range closure-idx)])
     (test-program-press tp #\j))
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter)
   ;; Find the top-level CODE child in the flat items
   (define a1 (test-program-value tp))
   (define code-idx
@@ -899,7 +906,7 @@
             (app-items a2)))
   (check-true (> (length detail-items) 0) "should have assembly detail lines"))
 
-(test-case "d toggle-off removes CODE children"
+(test-case "collapse after expand-describe keeps description cached"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -918,17 +925,18 @@
            i)))
   (check-not-false closure-idx)
   (define id (flat-item-id (list-ref (app-items a0) closure-idx)))
-  ;; Navigate to closure and press d (on)
+  ;; Navigate to closure and expand (auto-describe)
   (for ([_ (in-range closure-idx)])
     (test-program-press tp #\j))
-  (test-program-press tp #\d)
+  (test-program-press tp 'enter)
   (define a1 (test-program-value tp))
   (check-true (pair? (find-tnode-children (app-tree a1) id)) "children added")
-  ;; Press d again (off)
-  (test-program-press tp #\d)
+  ;; Collapse
+  (test-program-press tp 'enter)
   (define a2 (test-program-value tp))
-  (check-true (null? (find-tnode-children (app-tree a2) id)) "children removed")
-  (check-false (hash-has-key? (app-descriptions a2) id) "description removed"))
+  (check-false (set-member? (app-expanded a2) id) "should be collapsed")
+  ;; Description stays in cache (children remain in tree, just hidden)
+  (check-true (hash-has-key? (app-descriptions a2) id) "description remains cached"))
 
 (test-case "format-entry-description produces non-empty lines"
   (check-true (pair? (format-entry-description '#(CODE 0 0 "test" 1 #f () #"abc" 0 #()))))
@@ -1061,7 +1069,7 @@
   (check-true (string? desc) "fixnum should produce string description")
   (check-regexp-match #rx"42" desc))
 
-(test-case "d on every vfasl entry in petite-vfasl.boot works in TUI"
+(test-case "expand every vfasl entry in petite-vfasl.boot works in TUI"
   ;; Exercises the full TUI pipeline for each vfasl entry
   (define pf (parse-file petite-vfasl-path))
   (define tp
@@ -1087,12 +1095,86 @@
       (test-program-press tp #\j))
     (define before (test-program-value tp))
     (define id (flat-item-id (list-ref (app-items before) (app-cursor before))))
-    (test-program-press tp #\d) ; describe
+    (test-program-press tp 'enter) ; expand (auto-describe)
     (define after (test-program-value tp))
-    ;; Description should load (or be a no-op for non-describable items)
+    ;; Description should load
     (when (regexp-match? #rx"\\[vfasl\\]"
                          (flat-item-label (list-ref (app-items before) (app-cursor before))))
       (check-false (hash-empty? (app-descriptions after))
-                   (format "d on vfasl entry ~a should load description" vfasl-idx)))
-    ;; Toggle off
-    (test-program-press tp #\d)))
+                   (format "expanding vfasl entry ~a should load description" vfasl-idx)))
+    ;; Collapse
+    (test-program-press tp 'enter)))
+
+;; -------------------------------------------------------------------
+;; Assembly lines should not be italic (detail-style is italic,
+;; but assembly and RELOC lines use asm-detail-style which is not)
+
+;; Walk a kettle image tree and collect (style . text) pairs
+(define (collect-styled-texts img)
+  (cond
+    [(image:styled? img)
+     (define s (image:styled-style img))
+     (define inner (image:styled-inner img))
+     (if (and s (image:text? inner))
+         (list (cons s (image:text-str inner)))
+         (collect-styled-texts inner))]
+    [(image:vcat? img)
+     (apply append (map collect-styled-texts (image:vcat-children img)))]
+    [(image:hcat? img)
+     (apply append (map collect-styled-texts (image:hcat-children img)))]
+    [else '()]))
+
+(define (asm-line? str)
+  ;; Assembly lines have hex address patterns like "  0: 48c7c5..." or "  1a: 4d8b...".
+  ;; The address is purely hex digits followed by colon, then hex instruction bytes.
+  ;; Use a tighter pattern: space + hex-only-word + colon + space + hex bytes.
+  (or (regexp-match? #rx" +[0-9a-f]+: +[0-9a-f][0-9a-f][0-9a-f]" str)
+      (regexp-match? #rx"RELOC " str)))
+
+(test-case "assembly lines are not italic in expanded fasl object"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 60))
+  (test-program-press tp 'enter) ; expand root
+  ;; Find first closure object and expand it (triggers describe)
+  (define a0 (test-program-value tp))
+  (define closure-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
+           i)))
+  (check-not-false closure-idx)
+  (for ([_ (in-range closure-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp 'enter) ; expand — auto-describe with CODE children
+  ;; Expand the top-level CODE child
+  (define a1 (test-program-value tp))
+  (define code-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a1))])
+      (and (regexp-match? #rx"^CODE .* top-level" (flat-item-label item))
+           i)))
+  (check-not-false code-idx "should find CODE child")
+  (define cur (app-cursor a1))
+  (define delta (- code-idx cur))
+  (for ([_ (in-range (abs delta))])
+    (test-program-press tp (if (> delta 0) #\j #\k)))
+  (test-program-press tp 'enter) ; expand CODE child to show assembly
+  ;; Move down into the assembly lines so they're visible
+  (for ([_ (in-range 3)])
+    (test-program-press tp #\j))
+  (define a2 (test-program-value tp))
+  (define img (app-to-view a2))
+  (define pairs (collect-styled-texts img))
+  ;; Assembly lines should not be italic
+  (define asm-pairs (filter (lambda (p) (asm-line? (cdr p))) pairs))
+  (check-true (> (length asm-pairs) 0) "should have assembly lines in view")
+  (for ([p (in-list asm-pairs)])
+    (check-false (style-italic? (car p))
+                 (format "assembly line should not be italic: ~a"
+                         (substring (cdr p) 0 (min 60 (string-length (cdr p))))))))

@@ -38,7 +38,7 @@
           fg-bright-red
           fg-cyan
           fg-bright-yellow
-          fg-bright-black))
+          fg-bright-magenta))
 
 (define (format-bytes n)
   (cond
@@ -115,12 +115,12 @@
             name
             machine-str
             version-str
-            (length headers)
+            (length header-children)
             (length objects))
     '()
     (append
      (if (pair? header-children)
-         (list (tnode (make-id "hdr-group") (format "Headers (~a)" (length headers)) '() header-children #t))
+         (list (tnode (make-id "hdr-group") (format "Headers (~a)" (length header-children)) '() header-children #t))
          '())
      object-children)
     #t)))
@@ -262,6 +262,15 @@
 (define (sexp->detail-lines v)
   (string-split (pretty-print-to-string v) "\n"))
 
+;; Extract assembly string lines from an #%assembly-code form,
+;; stripping the sexp wrapper and trailing empty strings.
+(define (assembly-form->lines form)
+  (and (pair? form)
+       (eq? (car form) '#%assembly-code)
+       (let ([lines (filter (lambda (s) (and (string? s) (not (equal? s ""))))
+                            (cdr form))])
+         (and (pair? lines) lines))))
+
 (define (decompile-to-details v)
   (with-handlers ([exn:fail? (lambda (e)
                                 (list (format "(decompile error: ~a)" (exn-message e))))])
@@ -269,7 +278,8 @@
     (cond
       [(list? result)
        (apply append (for/list ([form (in-list result)])
-                       (sexp->detail-lines form)))]
+                       (or (assembly-form->lines form)
+                           (sexp->detail-lines form))))]
       [else (sexp->detail-lines result)])))
 
 (define (build-linkl-bundle-children bundle prefix)
@@ -299,9 +309,13 @@
              ;; linklet structs return a list of forms
              [(list? result)
               (apply append (for/list ([form (in-list result)])
-                              (sexp->detail-lines form)))]
+                              (or (assembly-form->lines form)
+                                  (sexp->detail-lines form))))]
              [else (sexp->detail-lines result)])))
-       (tnode id (format "'~a" k) details '() (pair? details))])))
+       ;; If the only detail line is "#<opaque>", make non-expandable
+       (define opaque? (and (= (length details) 1) (equal? (first details) "#<opaque>")))
+       (tnode id (format "'~a~a" k (if opaque? "  (opaque)" ""))
+              (if opaque? '() details) '() (and (not opaque?) (pair? details)))])))
 
 (define (build-zo-tree name zo)
   (define content (zo-file-content zo))
@@ -389,21 +403,21 @@
 (define header-style (make-style #:bold #t #:reverse #t))
 (define footer-style (make-style #:bold #t #:reverse #t))
 (define cursor-style (make-style #:reverse #t))
-(define detail-style (make-style #:foreground fg-bright-black))
+(define detail-style (make-style #:foreground fg-bright-white #:italic #t))
+(define asm-detail-style (make-style #:foreground fg-white))
 (define index-style (make-style #:foreground fg-bright-black #:bold #t))
 
 (define kind-colors (hasheq 'fasl fg-blue 'vfasl fg-magenta))
 
 (define sit-colors (hasheq 'visit fg-green 'revisit fg-yellow 'visit-revisit fg-cyan))
 
-(define comp-colors (hasheq 'uncompressed fg-bright-black 'lz4 fg-green 'gzip fg-yellow))
+(define comp-colors (hasheq 'uncompressed fg-white 'lz4 fg-green 'gzip fg-yellow))
 
 (define search-style (make-style #:bold #t))
 
 (define (render-view items cursor scroll width height file-path total-items
                      #:search-mode? [search-mode? #f]
-                     #:search-query [search-query ""]
-                     #:cursor-describable? [cursor-describable? #f])
+                     #:search-query [search-query ""])
   (define content-height (- height 2)) ; header + footer
   (define visible
     (take (drop items (min scroll (length items)))
@@ -440,8 +454,7 @@
              100
              (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
        (define footer-text
-         (format " ~a/~a  ~a%%  [j/k]move ~a[/]search [q]quit " (add1 cursor) total-items pct
-                 (if cursor-describable? "[d]describe " "")))
+         (format " ~a/~a  ~a%%  [j/k]move [/]search [q]quit " (add1 cursor) total-items pct))
        (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
        (styled footer-style (text (string-append footer-text footer-pad)))]))
 
@@ -472,14 +485,20 @@
         ;; Color vspace lines
         (define vspace-match
           (for/or ([i (in-range (vector-length vspace-names))])
-            (and (regexp-match? (regexp (string-append "^\\s*" (vector-ref vspace-names i) " "))
+            (and (regexp-match? (regexp (string-append "^ *" (vector-ref vspace-names i) " "))
                                 label)
                  i)))
-        (if vspace-match
-            (styled (make-style #:foreground (vector-ref vspace-colors vspace-match)) (text padded))
-            (styled detail-style (text padded)))]
+        (cond
+          [vspace-match
+           (styled (make-style #:foreground (vector-ref vspace-colors vspace-match)) (text padded))]
+          ;; Assembly lines: hex address pattern or RELOC lines
+          [(or (regexp-match? #rx"^ +[0-9a-f]+:" label)
+               (regexp-match? #rx"^RELOC " label))
+           (styled asm-detail-style (text padded))]
+          [else
+           (styled detail-style (text padded))])]
        ;; Color based on content for object lines
        [(and (not is-detail?) (not expandable?) id)
-        ;; Leaf item (header entry etc) - dim
-        (styled (make-style #:foreground fg-bright-black) (text padded))]
+        ;; Leaf item (header entry etc)
+        (styled (make-style #:foreground fg-white) (text padded))]
        [else (text padded)])]))
