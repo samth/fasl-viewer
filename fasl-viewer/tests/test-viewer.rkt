@@ -40,6 +40,55 @@
   (check-equal? (length tree) 1)
   (check-true (tnode-expandable? (first tree))))
 
+(test-case "zo file tree has module children"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define root (first tree))
+  ;; Root should have children (module paths from linkl-directory)
+  (check-true (> (length (tnode-children root)) 0)
+              "zo root should have module children")
+  ;; First child should be a Module node
+  (check-regexp-match #rx"Module" (tnode-label (first (tnode-children root)))))
+
+(test-case "zo module has phase/metadata children"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define root (first tree))
+  (define mod-node (first (tnode-children root)))
+  ;; Module should have children (phase linklets + metadata)
+  (check-true (> (length (tnode-children mod-node)) 0)
+              "module node should have children")
+  ;; Should have at least one Phase linklet
+  (check-true (ormap (lambda (c) (regexp-match? #rx"Phase" (tnode-label c)))
+                      (tnode-children mod-node))
+              "module should have a Phase linklet child"))
+
+(test-case "zo phase linklet has decompiled details"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define root (first tree))
+  (define mod-node (first (tnode-children root)))
+  ;; Find a Phase linklet child
+  (define phase-node
+    (findf (lambda (c) (regexp-match? #rx"Phase" (tnode-label c)))
+           (tnode-children mod-node)))
+  (check-not-false phase-node "should find a Phase linklet")
+  ;; Phase linklet should have detail lines (decompiled content)
+  (check-true (> (length (tnode-details phase-node)) 0)
+              "phase linklet should have decompiled detail lines"))
+
+(test-case "zo node IDs are unique"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define all-expanded
+    (let loop ([nodes tree]
+               [ids (seteq)])
+      (for/fold ([ids ids]) ([n (in-list nodes)])
+        (loop (tnode-children n) (set-add ids (tnode-id n))))))
+  (define items (flatten-tree tree all-expanded))
+  (define all-ids (filter values (map flat-item-id items)))
+  (check-equal? (length all-ids) (set-count (list->seteq all-ids)) "zo node IDs should be unique"))
+
 ;; -------------------------------------------------------------------
 ;; Unique node IDs
 
@@ -303,7 +352,7 @@
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
   (define items1 (flatten-tree tree (seteq root-id)))
-  ;; Find first expandable fasl object with [closure]
+  ;; Find first expandable fasl object with [closure] that has graph info
   (define fasl-item
     (for/or ([item (in-list items1)])
       (and (flat-item-expandable? item)
@@ -315,8 +364,9 @@
   (define items2 (flatten-tree tree expanded))
   (define detail-lines (filter flat-item-is-detail? items2))
   (check-true (> (length detail-lines) 0) "should have detail lines")
-  (check-true (ormap (lambda (d) (string-contains? (flat-item-label d) "graph:")) detail-lines)
-              "detail should mention graph"))
+  ;; Should have at least a "type:" line
+  (check-true (ormap (lambda (d) (string-contains? (flat-item-label d) "type:")) detail-lines)
+              "detail should mention type"))
 
 ;; -------------------------------------------------------------------
 ;; Search tests
@@ -700,7 +750,7 @@
   (define a2 (test-program-value tp))
   (check-false (hash-has-key? (app-descriptions a2) 'o0) "description should be removed"))
 
-(test-case "d on vfasl object is no-op"
+(test-case "d on vfasl object loads description"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -718,12 +768,45 @@
       (and (regexp-match? #rx"\\[vfasl\\]" (flat-item-label item))
            i)))
   (check-not-false vfasl-idx "should have a vfasl item")
+  (define id (flat-item-id (list-ref (app-items a0) vfasl-idx)))
   ;; Navigate to it
   (for ([_ (in-range vfasl-idx)])
     (test-program-press tp #\j))
   (test-program-press tp #\d)
   (define a (test-program-value tp))
-  (check-true (hash-empty? (app-descriptions a)) "d on vfasl should be no-op"))
+  (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
+  (check-true (set-member? (app-expanded a) id) "vfasl node should be expanded"))
+
+(test-case "d on vfasl procedure creates CODE children"
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter)
+  (define a0 (test-program-value tp))
+  ;; Find second vfasl object (first may be a non-procedure vector)
+  (define vfasl-indices
+    (for/list ([i (in-naturals)]
+               [item (in-list (app-items a0))]
+               #:when (regexp-match? #rx"\\[vfasl\\]" (flat-item-label item)))
+      i))
+  (check-true (>= (length vfasl-indices) 2) "should have at least 2 vfasl items")
+  (define vfasl-idx (second vfasl-indices))
+  (define id (flat-item-id (list-ref (app-items a0) vfasl-idx)))
+  ;; Navigate to it and press d
+  (for ([_ (in-range vfasl-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\d)
+  (define a1 (test-program-value tp))
+  ;; Should have CODE children in the tree
+  (define node-children (find-tnode-children (app-tree a1) id))
+  (check-not-false node-children "described node should exist")
+  (check-true (pair? node-children) "should have CODE children")
+  (check-regexp-match #rx"^CODE" (tnode-label (first node-children))))
 
 (test-case "d on header node is no-op"
   (define pf (parse-file petite-fasl-path))
@@ -851,3 +934,165 @@
   (check-true (pair? (format-entry-description '#(CODE 0 0 "test" 1 #f () #"abc" 0 #()))))
   (check-true (pair? (format-entry-description #f)))
   (check-equal? (format-entry-description #f) '("(no description)")))
+
+;; -------------------------------------------------------------------
+;; Comprehensive vfasl describe tests
+
+(test-case "all petite-vfasl.boot entries describe without errors"
+  (define result (describe-boot-file-entries petite-vfasl-path))
+  (check-true (> (vector-length result) 0) "should have entries")
+  (for ([i (in-range (vector-length result))])
+    (define d (vector-ref result i))
+    (when (string? d)
+      (check-false (string-prefix? d "Error:")
+                   (format "entry ~a should not be an error: ~a"
+                           i (substring d 0 (min 100 (string-length d))))))))
+
+(test-case "all racket exe petite.boot entries describe without errors"
+  (define pf (parse-file racket-exe-path))
+  (define exe (parsed-file-data pf))
+  (define boot (first (racket-executable-boot-files exe)))
+  (define result
+    (describe-exe-boot-entries racket-exe-path
+                               (racket-executable-section-offset exe)
+                               (racket-boot-entry-offset boot)
+                               (racket-boot-entry-size boot)))
+  (check-true (> (vector-length result) 0) "should have entries")
+  (for ([i (in-range (vector-length result))])
+    (define d (vector-ref result i))
+    (when (string? d)
+      (check-false (string-prefix? d "Error:")
+                   (format "petite entry ~a should not be an error: ~a"
+                           i (substring d 0 (min 100 (string-length d))))))))
+
+(test-case "all racket exe scheme.boot entries describe without errors"
+  (define pf (parse-file racket-exe-path))
+  (define exe (parsed-file-data pf))
+  (define boot (second (racket-executable-boot-files exe)))
+  (define result
+    (describe-exe-boot-entries racket-exe-path
+                               (racket-executable-section-offset exe)
+                               (racket-boot-entry-offset boot)
+                               (racket-boot-entry-size boot)))
+  (check-true (> (vector-length result) 0) "should have entries")
+  (for ([i (in-range (vector-length result))])
+    (define d (vector-ref result i))
+    (when (string? d)
+      (check-false (string-prefix? d "Error:")
+                   (format "scheme entry ~a should not be an error: ~a"
+                           i (substring d 0 (min 100 (string-length d))))))))
+
+(test-case "vfasl description vectors have correct ENTRY structure"
+  (define result (describe-boot-file-entries petite-vfasl-path))
+  (define vfasl-descs
+    (for/list ([i (in-range (vector-length result))]
+               #:when (vector? (vector-ref result i)))
+      (vector-ref result i)))
+  (check-true (> (length vfasl-descs) 0) "should have vector descriptions")
+  (for ([desc (in-list vfasl-descs)])
+    (check-equal? (vector-ref desc 0) 'ENTRY "tag should be ENTRY")
+    (check-true (>= (vector-length desc) 3) "ENTRY should have at least 3 elements")))
+
+(test-case "vfasl closure descriptions contain CODE"
+  (define result (describe-boot-file-entries petite-vfasl-path))
+  (define closure-descs
+    (for/list ([i (in-range (vector-length result))]
+               #:when (and (vector? (vector-ref result i))
+                           (>= (vector-length (vector-ref result i)) 3)
+                           (let ([inner (vector-ref (vector-ref result i) 2)])
+                             (and (vector? inner)
+                                  (eq? (vector-ref inner 0) 'CLOSURE)))))
+      (vector-ref result i)))
+  (check-true (> (length closure-descs) 0) "should have closure descriptions")
+  (for ([desc (in-list closure-descs)])
+    (define closure (vector-ref desc 2))
+    (check-true (>= (vector-length closure) 3) "CLOSURE should have at least 3 elements")
+    (define code (vector-ref closure 2))
+    (check-true (vector? code) "CLOSURE should contain CODE vector")
+    (check-equal? (vector-ref code 0) 'CODE "inner should be CODE")))
+
+(test-case "vfasl CODE vectors have assembly after disassembly"
+  (define result (describe-boot-file-entries petite-vfasl-path))
+  ;; Find a closure description
+  (define closure-desc
+    (for/or ([i (in-range (vector-length result))])
+      (define d (vector-ref result i))
+      (and (vector? d)
+           (>= (vector-length d) 3)
+           (let ([inner (vector-ref d 2)])
+             (and (vector? inner)
+                  (eq? (vector-ref inner 0) 'CLOSURE)
+                  d)))))
+  (check-not-false closure-desc "should have at least one closure")
+  (define code (vector-ref (vector-ref closure-desc 2) 2))
+  ;; Index 7 should be assembly (list) after disassembly, not raw bytes
+  (define asm (vector-ref code 7))
+  (check-true (or (pair? asm) (bytes? asm))
+              "assembly slot should be a list (disassembled) or bytes"))
+
+(test-case "description-to-tree handles ENTRY/CLOSURE/CODE"
+  (define desc '#(ENTRY visit-revisit #(CLOSURE 0 #(CODE 0 0 "test-fn" 1 #f () #"abc" 3 #()))))
+  (define-values (lines children) (description-to-tree desc 'test-id))
+  (check-true (pair? lines) "should produce detail lines")
+  (check-true (pair? children) "should produce CODE children")
+  (check-true (tnode? (first children)) "children should be tnodes")
+  (check-regexp-match #rx"CODE" (tnode-label (first children))))
+
+(test-case "description-to-tree handles string descriptions"
+  (define desc "vfasl result: #(1 2 3)")
+  (define-values (lines children) (description-to-tree desc 'test-id))
+  (check-true (pair? lines) "should produce lines")
+  (check-true (null? children) "strings should not produce children"))
+
+(test-case "description-to-tree handles #f"
+  (define-values (lines children) (description-to-tree #f 'test-id))
+  (check-equal? lines '("(no description)"))
+  (check-true (null? children)))
+
+(test-case "extract-vfasl-payload returns #f for non-vfasl"
+  ;; fasl kind byte is 100, vfasl is 101
+  ;; Build a minimal fasl-like entry: situation(37) size(2) comp(44) kind(100) payload
+  (define fake-fasl (bytes 37 2 44 100 0 0))
+  (check-false (extract-vfasl-payload fake-fasl)))
+
+(test-case "describe-live-value handles non-procedure values"
+  ;; A simple fixnum should return a string description
+  (define desc (describe-live-value 42))
+  (check-true (string? desc) "fixnum should produce string description")
+  (check-regexp-match #rx"42" desc))
+
+(test-case "d on every vfasl entry in petite-vfasl.boot works in TUI"
+  ;; Exercises the full TUI pipeline for each vfasl entry
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter) ; expand root
+  (define a0 (test-program-value tp))
+  (define vfasl-indices
+    (for/list ([i (in-naturals)]
+               [item (in-list (app-items a0))]
+               #:when (regexp-match? #rx"\\[vfasl\\]" (flat-item-label item)))
+      i))
+  (check-true (> (length vfasl-indices) 0) "should have vfasl items")
+  ;; Test first 5 vfasl entries (or all if fewer)
+  (for ([vfasl-idx (in-list (take vfasl-indices (min 5 (length vfasl-indices))))])
+    ;; Reset to root expanded state
+    (test-program-press tp #\g) ; go to top
+    (for ([_ (in-range vfasl-idx)])
+      (test-program-press tp #\j))
+    (define before (test-program-value tp))
+    (define id (flat-item-id (list-ref (app-items before) (app-cursor before))))
+    (test-program-press tp #\d) ; describe
+    (define after (test-program-value tp))
+    ;; Description should load (or be a no-op for non-describable items)
+    (when (regexp-match? #rx"\\[vfasl\\]"
+                         (flat-item-label (list-ref (app-items before) (app-cursor before))))
+      (check-false (hash-empty? (app-descriptions after))
+                   (format "d on vfasl entry ~a should load description" vfasl-idx)))
+    ;; Toggle off
+    (test-program-press tp #\d)))

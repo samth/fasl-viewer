@@ -223,7 +223,7 @@
              (chez-boot-file-objects pf-data)]))
         (cond
           [(>= obj-idx (length objects)) a]
-          [(not (eq? 'fasl (fasl-object-kind (list-ref objects obj-idx)))) a]
+          [(not (memq (fasl-object-kind (list-ref objects obj-idx)) '(fasl vfasl))) a]
           [(hash-has-key? (app-descriptions a) id)
            (toggle-description-off a id)]
           [else
@@ -383,6 +383,14 @@
     [(window-size-msg w h) (resize a w h)]
     [_ a]))
 
+(define (cursor-describable? a)
+  (define items (app-items a))
+  (define cursor (app-cursor a))
+  (and (< cursor (length items))
+       (let ([id (flat-item-id (list-ref items cursor))])
+         (and id
+              (regexp-match? #rx"^(?:boot[0-9]+/)?o[0-9]+$" (symbol->string id))))))
+
 (define (app-to-view a)
   (render-view (app-items a)
                (app-cursor a)
@@ -392,7 +400,8 @@
                (app-file-path a)
                (length (app-items a))
                #:search-mode? (app-search-mode? a)
-               #:search-query (app-search-query a)))
+               #:search-query (app-search-query a)
+               #:cursor-describable? (cursor-describable? a)))
 
 (module+ main
   (define file-path (command-line #:program "fasl-viewer" #:args (file) file))

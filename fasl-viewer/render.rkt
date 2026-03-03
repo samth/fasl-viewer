@@ -8,7 +8,10 @@
          racket/list
          racket/match
          racket/set
+         racket/pretty
          kettle
+         compiler/zo-structs
+         compiler/decompile
          "parse.rkt")
 
 (provide build-tree
@@ -135,11 +138,18 @@
     [else (format "~a" type)]))
 
 (define (build-fasl-inner-details inner)
+  (define type (fasl-inner-info-type inner))
+  (define name (fasl-inner-info-name inner))
   (define gc (fasl-inner-info-graph-count inner))
   (define ge (fasl-inner-info-graph-external inner))
-  (if (and gc ge)
-      (list (format "graph: ~a entries, ~a external" gc ge))
-      '()))
+  (append
+   (list (format "type: ~a" type))
+   (if (and name (not (equal? name "")))
+       (list (format "name: ~a" name))
+       '())
+   (if (and gc ge)
+       (list (format "graph: ~a entries, ~a external" gc ge))
+       '())))
 
 (define (build-object-node obj [prefix ""])
   (define idx (fasl-object-index obj))
@@ -244,16 +254,114 @@
 ;; -------------------------------------------------------------------
 ;; .zo tree
 
+(define (pretty-print-to-string v)
+  (define out (open-output-string))
+  (pretty-print v out)
+  (string-trim (get-output-string out) #:left? #f))
+
+(define (sexp->detail-lines v)
+  (string-split (pretty-print-to-string v) "\n"))
+
+(define (decompile-to-details v)
+  (with-handlers ([exn:fail? (lambda (e)
+                                (list (format "(decompile error: ~a)" (exn-message e))))])
+    (define result (decompile v))
+    (cond
+      [(list? result)
+       (apply append (for/list ([form (in-list result)])
+                       (sexp->detail-lines form)))]
+      [else (sexp->detail-lines result)])))
+
+(define (build-linkl-bundle-children bundle prefix)
+  (define tbl (linkl-bundle-table bundle))
+  (define keys (sort (hash-keys tbl)
+                     (lambda (a b)
+                       (cond
+                         [(and (integer? a) (integer? b)) (< a b)]
+                         [(integer? a) #t]
+                         [(integer? b) #f]
+                         [else (symbol<? a b)]))))
+  (for/list ([k (in-list keys)])
+    (define v (hash-ref tbl k))
+    (define id (string->symbol (string-append prefix (format "k~a" k))))
+    (cond
+      [(integer? k)
+       (define details (decompile-to-details v))
+       (tnode id (format "Phase ~a linklet" k) details '() (pair? details))]
+      [else
+       (define details
+         (with-handlers ([exn:fail? (lambda (_) (list (format "~a" v)))])
+           (define result (decompile v))
+           (cond
+             ;; decompile wraps simple values in (quote val) — unwrap for display
+             [(and (pair? result) (eq? (car result) 'quote) (= (length result) 2))
+              (sexp->detail-lines (cadr result))]
+             ;; linklet structs return a list of forms
+             [(list? result)
+              (apply append (for/list ([form (in-list result)])
+                              (sexp->detail-lines form)))]
+             [else (sexp->detail-lines result)])))
+       (tnode id (format "'~a" k) details '() (pair? details))])))
+
 (define (build-zo-tree name zo)
-  (list (tnode 'root
-               (format "~a  (Racket .zo)" name)
-               (list (format "version: ~a" (zo-file-version zo))
-                     (format "machine: ~a" (zo-file-machine-type zo))
-                     (format "tag: ~a" (zo-file-tag zo))
-                     ""
-                     "(Full linklet bundle parsing not yet implemented)")
-               '()
-               #t)))
+  (define content (zo-file-content zo))
+  (define header-details
+    (list (format "version: ~a" (zo-file-version zo))
+          (format "machine: ~a" (zo-file-machine-type zo))
+          (format "tag: ~a" (zo-file-tag zo))))
+  (cond
+    [(not content)
+     (list (tnode 'root
+                  (format "~a  (Racket .zo)" name)
+                  (append header-details (list "" "(zo-parse failed)"))
+                  '()
+                  #t))]
+    [(linkl-directory? content)
+     (define tbl (linkl-directory-table content))
+     (define keys (sort (hash-keys tbl)
+                        (lambda (a b)
+                          (cond
+                            [(and (null? a) (null? b)) #f]
+                            [(null? a) #t]
+                            [(null? b) #f]
+                            [else (string<? (format "~a" a) (format "~a" b))]))))
+     (define children
+       (for/list ([k (in-list keys)]
+                  [i (in-naturals)])
+         (define bundle (hash-ref tbl k))
+         (define prefix (format "mod~a/" i))
+         (define mod-label (format "Module ~a" k))
+         (define bundle-children (build-linkl-bundle-children bundle prefix))
+         (tnode (string->symbol (format "mod~a" i))
+                mod-label
+                '()
+                bundle-children
+                (pair? bundle-children))))
+     (list (tnode 'root
+                  (format "~a  (Racket .zo)" name)
+                  header-details
+                  children
+                  #t))]
+    [(linkl-bundle? content)
+     (define children (build-linkl-bundle-children content "b/"))
+     (list (tnode 'root
+                  (format "~a  (Racket .zo)" name)
+                  header-details
+                  children
+                  #t))]
+    [(linkl? content)
+     (define details (append header-details (list "") (decompile-to-details content)))
+     (list (tnode 'root
+                  (format "~a  (Racket .zo)" name)
+                  details
+                  '()
+                  #t))]
+    [else
+     (list (tnode 'root
+                  (format "~a  (Racket .zo)" name)
+                  (append header-details (list "" (format "(unknown zo content type: ~a)" content)))
+                  '()
+                  #t))]))
 
 ;; -------------------------------------------------------------------
 ;; Flatten tree into visible lines
@@ -294,7 +402,8 @@
 
 (define (render-view items cursor scroll width height file-path total-items
                      #:search-mode? [search-mode? #f]
-                     #:search-query [search-query ""])
+                     #:search-query [search-query ""]
+                     #:cursor-describable? [cursor-describable? #f])
   (define content-height (- height 2)) ; header + footer
   (define visible
     (take (drop items (min scroll (length items)))
@@ -331,7 +440,8 @@
              100
              (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
        (define footer-text
-         (format " ~a/~a  ~a%%  [j/k]move [/]search [q]quit " (add1 cursor) total-items pct))
+         (format " ~a/~a  ~a%%  [j/k]move ~a[/]search [q]quit " (add1 cursor) total-items pct
+                 (if cursor-describable? "[d]describe " "")))
        (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
        (styled footer-style (text (string-append footer-text footer-pad)))]))
 

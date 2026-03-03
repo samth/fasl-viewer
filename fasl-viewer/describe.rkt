@@ -8,7 +8,8 @@
 ;; the header is patched to match the running Chez VM to avoid version
 ;; mismatch errors.
 
-(require ffi/unsafe/vm
+(require ffi/unsafe
+         ffi/unsafe/vm
          compiler/private/chez
          racket/pretty
          racket/port
@@ -17,12 +18,16 @@
          racket/match
          racket/set
          racket/file
-         "render.rkt")
+         "render.rkt"
+         "parse.rkt")
 
 (provide describe-boot-file-entries
          describe-exe-boot-entries
          format-entry-description
-         description-to-tree)
+         description-to-tree
+         ;; For testing
+         extract-vfasl-payload
+         describe-live-value)
 
 ;; Describe all entries in a standalone .boot file.
 ;; Returns a vector of entry descriptions (one per fasl object).
@@ -63,7 +68,14 @@
               (let ([desc (car entry-descs)])
                 (disassemble-in-description desc)
                 desc)))]
-      [(list 'vfasl _) #f])))
+      [(list 'vfasl entry-bytes)
+       (with-handlers ([exn:fail? (lambda (e) (format "Error: ~a" (exn-message e)))])
+         (define payload (extract-vfasl-payload entry-bytes))
+         (and payload
+              (let ([val ((get-vfasl-to) payload)])
+                (define desc (describe-live-value val))
+                (when (vector? desc) (disassemble-in-description desc))
+                desc)))])))
 
 ;; -------------------------------------------------------------------
 ;; Boot file scanner: extract header bytes and entry byte ranges
@@ -175,6 +187,130 @@
     (define b (read-byte in))
     (unless (or (eof-object? b) (= b (char->integer #\))))
       (loop))))
+
+;; -------------------------------------------------------------------
+;; vfasl description: load vfasl data into VM and inspect live values
+
+(define vfasl-to-proc #f)
+
+(define (get-vfasl-to)
+  (unless vfasl-to-proc
+    (set! vfasl-to-proc
+      (vm-eval '(foreign-procedure "(cs)vfasl_to" (scheme-object) scheme-object))))
+  vfasl-to-proc)
+
+(define (extract-vfasl-payload entry-bytes)
+  (with-handlers ([exn:fail? (lambda (e) #f)])
+    (define in (open-input-bytes entry-bytes))
+    (read-byte in)    ; situation byte
+    (read-uptr* in)   ; size
+    (define comp-byte (read-byte in))
+    (define kind-byte (read-byte in))
+    (unless (= kind-byte 101) (error "not vfasl"))
+    (case comp-byte
+      [(44) ; uncompressed
+       (port->bytes in)]
+      [(46) ; LZ4
+       (define usize (read-uptr* in))
+       (define compressed (port->bytes in))
+       (lz4-decompress compressed usize)]
+      [(45) ; gzip
+       (read-uptr* in) ; skip usize
+       (define compressed (port->bytes in))
+       (gzip-decompress compressed)]
+      [else #f])))
+
+(define (describe-live-value val)
+  (define type
+    (with-handlers ([exn:fail? (lambda (e) 'other)])
+      (vm-eval `(cond
+                  [(procedure? ',val) 'procedure]
+                  [(($primitive $code?) ',val) 'code]
+                  [else 'other]))))
+  (case type
+    [(procedure)
+     (define insp (vm-eval `(inspect/object ',val)))
+     (define code-insp (insp 'code))
+     (define code-desc (describe-live-code code-insp (make-hasheq)))
+     (vector 'ENTRY 'visit-revisit (vector 'CLOSURE 0 code-desc))]
+    [(code)
+     (define insp (vm-eval `(inspect/object ',val)))
+     (define code-desc (describe-live-code insp (make-hasheq)))
+     (vector 'ENTRY 'visit-revisit code-desc)]
+    [else
+     (with-handlers ([exn:fail? (lambda (e) (format "vfasl result: ~a" (exn-message e)))])
+       (vm-eval `(parameterize ([print-level 4] [print-length 10])
+                   (format "~s" ',val))))]))
+
+(define (describe-live-code code-insp seen)
+  (define code-value (code-insp 'value))
+  (cond
+    [(hash-ref seen code-value #f)
+     ;; Cycle: return stub
+     (vector 'CODE 0 0
+             (with-handlers ([exn:fail? (lambda (e) #f)]) (code-insp 'name))
+             0 #f '() #"" 0 #())]
+    [else
+     (hash-set! seen code-value #t)
+     (define name
+       (with-handlers ([exn:fail? (lambda (e) #f)])
+         (code-insp 'name)))
+     (define arity-mask
+       (with-handlers ([exn:fail? (lambda (e) 0)])
+         (code-insp 'arity-mask)))
+     (define free-count
+       (with-handlers ([exn:fail? (lambda (e) 0)])
+         (code-insp 'free-count)))
+     (define bstr (extract-machine-code code-value))
+     (define relocs-vec (build-reloc-descriptions code-insp seen))
+     (vector 'CODE 0 free-count name arity-mask #f '() bstr
+             (bytes-length bstr) relocs-vec)]))
+
+(define (extract-machine-code code-value)
+  (with-handlers ([exn:fail? (lambda (e) #"")])
+    (vm-eval
+     `(let ([code ',code-value]
+            [memcpy ',(lambda (to from len)
+                        (memcpy to (cast from _uintptr _pointer) len))])
+        (lock-object code)
+        (let* ([code-p (($primitive $object-address) code 1)]
+               [length (foreign-ref 'uptr code-p (foreign-sizeof 'uptr))]
+               [body-p (+ code-p (* 8 (foreign-sizeof 'uptr)))]
+               [bstr (make-bytevector length)])
+          (memcpy bstr body-p length)
+          (unlock-object code)
+          bstr)))))
+
+(define (build-reloc-descriptions code-insp seen)
+  (with-handlers ([exn:fail? (lambda (e) #())])
+    (define pairs
+      (with-handlers ([exn:fail? (lambda (e) '())])
+        ((code-insp 'reloc+offset) 'value)))
+    (list->vector
+     (for/list ([ro (in-list pairs)])
+       (define val (car ro))
+       (define offset (cdr ro))
+       (define val-desc (describe-reloc-value val seen))
+       (vector 'RELOC "reloc" offset 0 val-desc)))))
+
+(define (describe-reloc-value val seen)
+  (define type
+    (with-handlers ([exn:fail? (lambda (e) 'other)])
+      (vm-eval `(cond
+                  [(procedure? ',val) 'procedure]
+                  [(($primitive $code?) ',val) 'code]
+                  [else 'other]))))
+  (case type
+    [(procedure)
+     (with-handlers ([exn:fail? (lambda (e) val)])
+       (define insp (vm-eval `(inspect/object ',val)))
+       (define code-insp (insp 'code))
+       (vector 'CLOSURE 0 (describe-live-code code-insp seen)))]
+    [(code)
+     (with-handlers ([exn:fail? (lambda (e) val)])
+       (define insp (vm-eval `(inspect/object ',val)))
+       (describe-live-code insp seen))]
+    [else val]))
 
 ;; -------------------------------------------------------------------
 ;; description-to-tree: convert a fasl description into detail strings

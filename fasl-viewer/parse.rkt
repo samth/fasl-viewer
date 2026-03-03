@@ -7,12 +7,15 @@
          racket/list
          racket/port
          racket/file
-         file/gunzip)
+         file/gunzip
+         compiler/zo-parse)
 
 (provide parse-file
          format-scheme-version
          lookup-machine-type
          lookup-fasl-content-type
+         lz4-decompress
+         gzip-decompress
 
          ;; Parsed structures
          (struct-out parsed-file)
@@ -60,7 +63,7 @@
 (struct racket-boot-entry (offset size boot) #:transparent)
 
 ;; Racket .zo file
-(struct zo-file (version machine-type tag hash) #:transparent)
+(struct zo-file (version machine-type tag hash content) #:transparent)
 
 ;; Unknown format
 (struct unknown-file (first-bytes) #:transparent)
@@ -404,7 +407,12 @@
              (>= (bytes-length magic) 2)
              (= (bytes-ref magic 0) #x23)
              (= (bytes-ref magic 1) #x7e))
-        (parsed-file path 'zo (parse-zo in))]
+        (define hdr (parse-zo in))
+        (file-position in 0)
+        (define content
+          (with-handlers ([exn:fail? (lambda (e) #f)])
+            (zo-parse in)))
+        (parsed-file path 'zo (struct-copy zo-file hdr [content content]))]
        ;; ELF: 7f 45 4c 46
        [(and (bytes? magic)
              (>= (bytes-length magic) 4)
@@ -837,4 +845,4 @@
       [(= tag-byte (char->integer #\D)) "D (directory)"]
       [(= tag-byte (char->integer #\T)) "T (linklet)"]
       [else (format "~a" (integer->char tag-byte))]))
-  (zo-file version-str machine-type-str tag ""))
+  (zo-file version-str machine-type-str tag "" #f))
