@@ -4,18 +4,21 @@
 
 (require racket/cmdline
          racket/match
+         racket/list
          racket/set
          racket/string
          kettle
          kettle/run
          "parse.rkt"
-         "render.rkt")
+         "render.rkt"
+         "describe.rkt")
 
 (provide make-app
          app-on-key
          app-on-msg
          app-to-view
-         (struct-out app))
+         (struct-out app)
+         find-tnode-children)
 
 ;; Application state
 (struct app
@@ -29,14 +32,20 @@
          file-path ; original file path
          search-mode? ; #t when typing a search query
          search-query ; current search string
-         search-origin) ; cursor position before search started
+         search-origin ; cursor position before search started
+         parsed ; parsed-file struct
+         describe-cache ; (hasheq key -> (vectorof any/c))
+         descriptions ; (hasheq symbol? -> (listof string?))
+         base-details ; (hasheq symbol? -> (listof string?))
+         base-children) ; (hasheq symbol? -> (listof tnode?))
   #:transparent)
 
 (define (make-app pf)
   (define tree (build-tree pf))
   (define expanded (seteq)) ; start collapsed
   (define items (flatten-tree tree expanded))
-  (app tree items 0 expanded 80 24 0 (parsed-file-path pf) #f "" 0))
+  (app tree items 0 expanded 80 24 0 (parsed-file-path pf) #f "" 0
+       pf (hasheq) (hasheq) (hasheq) (hasheq)))
 
 (define (rebuild-items a)
   (define items (flatten-tree (app-tree a) (app-expanded a)))
@@ -185,6 +194,150 @@
   (< (char->integer c) 32))
 
 ;; -------------------------------------------------------------------
+;; Describe (d key) — deep fasl inspection
+
+(define (describe-current a)
+  (define items (app-items a))
+  (define cursor (app-cursor a))
+  (when (>= cursor (length items)) (void))
+  (define item (list-ref items cursor))
+  (define id (flat-item-id item))
+  (cond
+    [(not id) a]
+    [else
+     (define id-str (symbol->string id))
+     (define m (regexp-match #rx"^(?:boot([0-9]+)/)?o([0-9]+)$" id-str))
+     (cond
+       [(not m) a]
+       [else
+        (define boot-idx (and (second m) (string->number (second m))))
+        (define obj-idx (string->number (third m)))
+        ;; Check that this is a fasl (not vfasl) object
+        (define pf-data (parsed-file-data (app-parsed a)))
+        (define objects
+          (cond
+            [boot-idx
+             (define entry (list-ref (racket-executable-boot-files pf-data) boot-idx))
+             (chez-boot-file-objects (racket-boot-entry-boot entry))]
+            [else
+             (chez-boot-file-objects pf-data)]))
+        (cond
+          [(>= obj-idx (length objects)) a]
+          [(not (eq? 'fasl (fasl-object-kind (list-ref objects obj-idx)))) a]
+          [(hash-has-key? (app-descriptions a) id)
+           (toggle-description-off a id)]
+          [else
+           (toggle-description-on a id boot-idx obj-idx)])])]))
+
+(define (toggle-description-on a id boot-idx obj-idx)
+  (define cache-key boot-idx)
+  (define cache (app-describe-cache a))
+  (define-values (new-cache desc)
+    (cond
+      [(hash-ref cache cache-key #f)
+       => (lambda (entries)
+            (values cache (and (< obj-idx (vector-length entries))
+                               (vector-ref entries obj-idx))))]
+      [else
+       (with-handlers
+         ([exn:fail?
+           (lambda (e)
+             (define err-vec (vector (format "Error: ~a" (exn-message e))))
+             (values (hash-set cache cache-key err-vec)
+                     (format "Error: ~a" (exn-message e))))])
+         (define entries (load-descriptions a boot-idx))
+         (define new-c (hash-set cache cache-key entries))
+         (values new-c (and (< obj-idx (vector-length entries))
+                            (vector-ref entries obj-idx))))]))
+  (define-values (desc-lines desc-children) (description-to-tree desc id))
+  ;; Save original details if not already saved
+  (define base (or (find-tnode-details (app-tree a) id) '()))
+  (define new-base-details
+    (if (hash-has-key? (app-base-details a) id)
+        (app-base-details a)
+        (hash-set (app-base-details a) id base)))
+  (define actual-base (hash-ref new-base-details id base))
+  (define new-details (append actual-base (if (pair? actual-base) (list "") '()) desc-lines))
+  ;; Save original children
+  (define base-ch (or (find-tnode-children (app-tree a) id) '()))
+  (define new-base-children
+    (if (hash-has-key? (app-base-children a) id)
+        (app-base-children a)
+        (hash-set (app-base-children a) id base-ch)))
+  (define orig-ch (hash-ref new-base-children id base-ch))
+  (define new-children (append orig-ch desc-children))
+  (define new-tree (update-tnode-in-tree (app-tree a) id new-details new-children))
+  (define new-expanded (set-add (app-expanded a) id))
+  (define new-descriptions (hash-set (app-descriptions a) id desc-lines))
+  (ensure-visible
+   (rebuild-items
+    (struct-copy app a
+                 [tree new-tree]
+                 [expanded new-expanded]
+                 [describe-cache new-cache]
+                 [descriptions new-descriptions]
+                 [base-details new-base-details]
+                 [base-children new-base-children]))))
+
+(define (toggle-description-off a id)
+  (define base-lines (hash-ref (app-base-details a) id '()))
+  (define base-ch (hash-ref (app-base-children a) id '()))
+  (define new-tree (update-tnode-in-tree (app-tree a) id base-lines base-ch))
+  (define new-descriptions (hash-remove (app-descriptions a) id))
+  ;; Remove desc children from expanded set
+  (define id-prefix (format "~a." id))
+  (define new-expanded
+    (let ([exp (if (null? base-lines)
+                   (set-remove (app-expanded a) id)
+                   (app-expanded a))])
+      (for/fold ([e exp]) ([eid (in-set exp)])
+        (if (string-prefix? (symbol->string eid) id-prefix)
+            (set-remove e eid)
+            e))))
+  (ensure-visible
+   (rebuild-items
+    (struct-copy app a
+                 [tree new-tree]
+                 [expanded new-expanded]
+                 [descriptions new-descriptions]))))
+
+(define (load-descriptions a boot-idx)
+  (define pf-data (parsed-file-data (app-parsed a)))
+  (cond
+    [boot-idx
+     (define exe pf-data)
+     (define entry (list-ref (racket-executable-boot-files exe) boot-idx))
+     (describe-exe-boot-entries (app-file-path a)
+                                (racket-executable-section-offset exe)
+                                (racket-boot-entry-offset entry)
+                                (racket-boot-entry-size entry))]
+    [else
+     (describe-boot-file-entries (app-file-path a))]))
+
+(define (update-tnode-in-tree nodes target-id new-details [new-children #f])
+  (for/list ([n (in-list nodes)])
+    (if (eq? (tnode-id n) target-id)
+        (let ([children (or new-children (tnode-children n))])
+          (struct-copy tnode n
+            [details new-details]
+            [children children]
+            [expandable? (or (pair? new-details) (pair? children))]))
+        (struct-copy tnode n
+          [children (update-tnode-in-tree (tnode-children n) target-id new-details new-children)]))))
+
+(define (find-tnode-details nodes id)
+  (for/or ([n (in-list nodes)])
+    (cond
+      [(eq? (tnode-id n) id) (tnode-details n)]
+      [else (find-tnode-details (tnode-children n) id)])))
+
+(define (find-tnode-children nodes id)
+  (for/or ([n (in-list nodes)])
+    (cond
+      [(eq? (tnode-id n) id) (tnode-children n)]
+      [else (find-tnode-children (tnode-children n) id)])))
+
+;; -------------------------------------------------------------------
 ;; Key dispatch
 
 (define (app-on-key a msg)
@@ -216,6 +369,8 @@
        ;; Top / bottom
        [(key-msg #\g _ _) (goto-top a)]
        [(key-msg #\G _ _) (goto-bottom a)]
+       ;; Describe fasl entry
+       [(key-msg #\d _ #f) (describe-current a)]
        ;; Page down/up
        [(key-msg 'page-down _ _) (page-down a)]
        [(key-msg 'page-up _ _) (page-up a)]

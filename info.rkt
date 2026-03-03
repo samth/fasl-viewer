@@ -1,3 +1,3 @@
 #lang info
 (define collection 'multi)
-(define deps '("base" "kettle"))
+(define deps '("base" "kettle" "compiler-lib"))

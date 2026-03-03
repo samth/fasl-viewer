@@ -4,10 +4,12 @@
          racket/set
          racket/list
          racket/string
+         racket/hash
          kettle/test
          "../parse.rkt"
          "../render.rkt"
-         "../main.rkt")
+         "../main.rkt"
+         "../describe.rkt")
 
 ;; -------------------------------------------------------------------
 ;; Test data: parse real files for realistic testing
@@ -655,3 +657,197 @@
   (define a (test-program-value tp))
   (check-equal? (app-width a) 120)
   (check-equal? (app-height a) 40))
+
+;; -------------------------------------------------------------------
+;; Describe (d key) tests
+
+(test-case "d on fasl object loads description"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  ;; Expand root, navigate to first fasl object (past hdr-group)
+  (test-program-press tp 'enter)
+  (test-program-press tp #\j) ; hdr-group
+  (test-program-press tp #\j) ; o0
+  (test-program-press tp #\d)
+  (define a (test-program-value tp))
+  (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
+  (check-true (set-member? (app-expanded a) 'o0) "o0 should be auto-expanded"))
+
+(test-case "d toggles description off"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter)
+  (test-program-press tp #\j)
+  (test-program-press tp #\j)
+  ;; Toggle on
+  (test-program-press tp #\d)
+  (define a1 (test-program-value tp))
+  (check-true (hash-has-key? (app-descriptions a1) 'o0))
+  ;; Toggle off
+  (test-program-press tp #\d)
+  (define a2 (test-program-value tp))
+  (check-false (hash-has-key? (app-descriptions a2) 'o0) "description should be removed"))
+
+(test-case "d on vfasl object is no-op"
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter)
+  ;; Find a vfasl object by searching items
+  (define a0 (test-program-value tp))
+  (define vfasl-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (regexp-match? #rx"\\[vfasl\\]" (flat-item-label item))
+           i)))
+  (check-not-false vfasl-idx "should have a vfasl item")
+  ;; Navigate to it
+  (for ([_ (in-range vfasl-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\d)
+  (define a (test-program-value tp))
+  (check-true (hash-empty? (app-descriptions a)) "d on vfasl should be no-op"))
+
+(test-case "d on header node is no-op"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter)
+  (test-program-press tp #\j) ; hdr-group
+  (test-program-press tp #\d)
+  (define a (test-program-value tp))
+  (check-true (hash-empty? (app-descriptions a)) "d on header should be no-op"))
+
+(test-case "d on fasl closure creates CODE children"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter) ; expand root
+  ;; Find first closure object
+  (define a0 (test-program-value tp))
+  (define closure-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
+           i)))
+  (check-not-false closure-idx "should find a closure object")
+  ;; Navigate to it and press d
+  (for ([_ (in-range closure-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\d)
+  (define a1 (test-program-value tp))
+  (define id (flat-item-id (list-ref (app-items a0) closure-idx)))
+  ;; Should have CODE children in the tree
+  (define node-children (find-tnode-children (app-tree a1) id))
+  (check-not-false node-children "described node should exist")
+  (check-true (pair? node-children) "should have CODE children")
+  ;; First child should be labeled as top-level CODE
+  (check-regexp-match #rx"^CODE .* top-level" (tnode-label (first node-children))))
+
+(test-case "expanding CODE child shows assembly lines"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 60))
+  (test-program-press tp 'enter) ; expand root
+  ;; Find first closure object
+  (define a0 (test-program-value tp))
+  (define closure-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
+           i)))
+  (check-not-false closure-idx)
+  ;; Navigate to closure and press d
+  (for ([_ (in-range closure-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\d)
+  ;; Find the top-level CODE child in the flat items
+  (define a1 (test-program-value tp))
+  (define code-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a1))])
+      (and (regexp-match? #rx"^CODE .* top-level" (flat-item-label item))
+           i)))
+  (check-not-false code-idx "should find CODE child in items")
+  ;; Navigate to the CODE child and expand it
+  (define cur (app-cursor a1))
+  (define delta (- code-idx cur))
+  (for ([_ (in-range (abs delta))])
+    (test-program-press tp (if (> delta 0) #\j #\k)))
+  (test-program-press tp 'enter) ; expand CODE child
+  ;; Assembly lines should appear as detail items
+  (define a2 (test-program-value tp))
+  (define detail-items
+    (filter (lambda (item)
+              (and (flat-item-is-detail? item)
+                   (> (flat-item-depth item) (flat-item-depth (list-ref (app-items a2) code-idx)))))
+            (app-items a2)))
+  (check-true (> (length detail-items) 0) "should have assembly detail lines"))
+
+(test-case "d toggle-off removes CODE children"
+  (define pf (parse-file petite-fasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter) ; expand root
+  ;; Find first closure object
+  (define a0 (test-program-value tp))
+  (define closure-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (regexp-match? #rx"\\[closure\\]" (flat-item-label item))
+           i)))
+  (check-not-false closure-idx)
+  (define id (flat-item-id (list-ref (app-items a0) closure-idx)))
+  ;; Navigate to closure and press d (on)
+  (for ([_ (in-range closure-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\d)
+  (define a1 (test-program-value tp))
+  (check-true (pair? (find-tnode-children (app-tree a1) id)) "children added")
+  ;; Press d again (off)
+  (test-program-press tp #\d)
+  (define a2 (test-program-value tp))
+  (check-true (null? (find-tnode-children (app-tree a2) id)) "children removed")
+  (check-false (hash-has-key? (app-descriptions a2) id) "description removed"))
+
+(test-case "format-entry-description produces non-empty lines"
+  (check-true (pair? (format-entry-description '#(CODE 0 0 "test" 1 #f () #"abc" 0 #()))))
+  (check-true (pair? (format-entry-description #f)))
+  (check-equal? (format-entry-description #f) '("(no description)")))
