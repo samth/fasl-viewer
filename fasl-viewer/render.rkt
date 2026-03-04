@@ -271,6 +271,31 @@
                             (cdr form))])
          (and (pair? lines) lines))))
 
+;; Walk a sexp tree and extract #%assembly-code forms inline.
+;; Non-assembly parts are pretty-printed normally; assembly strings
+;; are emitted directly so they get assembly-line coloring.
+(define (sexp->detail-lines/asm v)
+  (define (has-assembly? v)
+    (and (pair? v)
+         (or (eq? (car v) '#%assembly-code)
+             (for/or ([sub (in-list v)])
+               (and (pair? sub) (has-assembly? sub))))))
+  (cond
+    [(not (has-assembly? v)) (sexp->detail-lines v)]
+    [(and (pair? v) (eq? (car v) '#%assembly-code))
+     (or (assembly-form->lines v) (sexp->detail-lines v))]
+    [else
+     ;; Walk the list, printing non-assembly sub-forms normally
+     ;; and extracting assembly strings inline
+     (apply append
+            (for/list ([sub (in-list v)])
+              (cond
+                [(and (pair? sub) (eq? (car sub) '#%assembly-code))
+                 (or (assembly-form->lines sub) (sexp->detail-lines sub))]
+                [(and (pair? sub) (has-assembly? sub))
+                 (sexp->detail-lines/asm sub)]
+                [else (sexp->detail-lines sub)])))]))
+
 (define (decompile-to-details v)
   (with-handlers ([exn:fail? (lambda (e)
                                 (list (format "(decompile error: ~a)" (exn-message e))))])
@@ -278,9 +303,8 @@
     (cond
       [(list? result)
        (apply append (for/list ([form (in-list result)])
-                       (or (assembly-form->lines form)
-                           (sexp->detail-lines form))))]
-      [else (sexp->detail-lines result)])))
+                       (sexp->detail-lines/asm form)))]
+      [else (sexp->detail-lines/asm result)])))
 
 (define (build-linkl-bundle-children bundle prefix)
   (define tbl (linkl-bundle-table bundle))
@@ -309,9 +333,8 @@
              ;; linklet structs return a list of forms
              [(list? result)
               (apply append (for/list ([form (in-list result)])
-                              (or (assembly-form->lines form)
-                                  (sexp->detail-lines form))))]
-             [else (sexp->detail-lines result)])))
+                              (sexp->detail-lines/asm form)))]
+             [else (sexp->detail-lines/asm result)])))
        ;; If the only detail line is "#<opaque>", make non-expandable
        (define opaque? (and (= (length details) 1) (equal? (first details) "#<opaque>")))
        (tnode id (format "'~a~a" k (if opaque? "  (opaque)" ""))
@@ -404,7 +427,8 @@
 (define footer-style (make-style #:bold #t #:reverse #t))
 (define cursor-style (make-style #:reverse #t))
 (define detail-style (make-style #:foreground fg-bright-white #:italic #t))
-(define asm-detail-style (make-style #:foreground fg-white))
+(define asm-hex-style (make-style #:foreground fg-white))
+(define asm-sexp-style (make-style #:foreground fg-cyan))
 (define index-style (make-style #:foreground fg-bright-black #:bold #t))
 
 (define kind-colors (hasheq 'fasl fg-blue 'vfasl fg-magenta))
@@ -491,10 +515,21 @@
         (cond
           [vspace-match
            (styled (make-style #:foreground (vector-ref vspace-colors vspace-match)) (text padded))]
-          ;; Assembly lines: hex address pattern or RELOC lines
-          [(or (regexp-match? #rx"^ +[0-9a-f]+:" label)
-               (regexp-match? #rx"^RELOC " label))
-           (styled asm-detail-style (text padded))]
+          ;; Assembly lines: hex address pattern — split hex from sexp mnemonic
+          [(regexp-match #rx"^( +[0-9a-f]+: [0-9a-f]+ +)(\\(.*)" label)
+           => (lambda (m)
+                (define hex-part (string-append indent arrow (second m)))
+                (define sexp-part (third m))
+                (define hex-len (string-length hex-part))
+                (define sexp-len (string-length sexp-part))
+                (define total (+ hex-len sexp-len))
+                (define pad (max 0 (- width total)))
+                (hcat 'left
+                      (styled asm-hex-style (text hex-part))
+                      (styled asm-sexp-style (text (string-append sexp-part (make-string pad #\space))))))]
+          ;; RELOC lines
+          [(regexp-match? #rx"^RELOC " label)
+           (styled asm-hex-style (text padded))]
           [else
            (styled detail-style (text padded))])]
        ;; Color based on content for object lines

@@ -57,7 +57,7 @@
       [(list 'fasl entry-bytes)
        ;; Single-entry boot file: header + entry (EOF signals end)
        (define mini-bv (bytes-append patched-header entry-bytes))
-       (with-handlers ([exn:fail? (lambda (e) (format "Error: ~a" (exn-message e)))])
+       (with-handlers ([(lambda (_) #t) (lambda (e) (format "Error: ~a" (if (exn? e) (exn-message e) e)))])
          (define result
            (vm-eval `(($primitive $describe-fasl-from-port) (open-bytevector-input-port ,mini-bv)
                                                             '#())))
@@ -69,13 +69,26 @@
                 (disassemble-in-description desc)
                 desc)))]
       [(list 'vfasl entry-bytes)
-       (with-handlers ([exn:fail? (lambda (e) (format "Error: ~a" (exn-message e)))])
-         (define payload (extract-vfasl-payload entry-bytes))
-         (and payload
-              (let ([val ((get-vfasl-to) payload)])
-                (define desc (describe-live-value val))
-                (when (vector? desc) (disassemble-in-description desc))
-                desc)))])))
+       (define payload
+         (with-handlers ([(lambda (_) #t) (lambda (_) #f)])
+           (extract-vfasl-payload entry-bytes)))
+       (cond
+         [(not payload) #f]
+         [else
+          (define val
+            (with-handlers ([(lambda (_) #t)
+                             (lambda (e) (format "Error: ~a" (if (exn? e) (exn-message e) e)))])
+              ((get-vfasl-to) payload)))
+          (cond
+            [(string? val) val] ; vfasl_to failed
+            [else
+             (define desc
+               (with-handlers ([(lambda (_) #t)
+                                (lambda (e) (format "Error: ~a" (if (exn? e) (exn-message e) e)))])
+                 (define d (describe-live-value val))
+                 (when (vector? d) (disassemble-in-description d))
+                 d))
+             desc])])])))
 
 ;; -------------------------------------------------------------------
 ;; Boot file scanner: extract header bytes and entry byte ranges
@@ -200,7 +213,7 @@
   vfasl-to-proc)
 
 (define (extract-vfasl-payload entry-bytes)
-  (with-handlers ([exn:fail? (lambda (e) #f)])
+  (with-handlers ([(lambda (_) #t) (lambda (e) #f)])
     (define in (open-input-bytes entry-bytes))
     (read-byte in)    ; situation byte
     (read-uptr* in)   ; size
@@ -222,44 +235,54 @@
 
 (define (describe-live-value val)
   (define type
-    (with-handlers ([exn:fail? (lambda (e) 'other)])
+    (with-handlers ([(lambda (_) #t) (lambda (e) 'other)])
       (vm-eval `(cond
                   [(procedure? ',val) 'procedure]
                   [(($primitive $code?) ',val) 'code]
                   [else 'other]))))
   (case type
     [(procedure)
-     (define insp (vm-eval `(inspect/object ',val)))
-     (define code-insp (insp 'code))
-     (define code-desc (describe-live-code code-insp (make-hasheq)))
-     (vector 'ENTRY 'visit-revisit (vector 'CLOSURE 0 code-desc))]
+     (with-handlers ([(lambda (_) #t) (lambda (e) (format "vfasl result: ~a"
+                                                          (if (exn? e) (exn-message e) e)))])
+       (define insp (vm-eval `(inspect/object ',val)))
+       (define code-insp (insp 'code))
+       (define code-desc (describe-live-code code-insp (make-hasheq)))
+       (vector 'ENTRY 'visit-revisit (vector 'CLOSURE 0 code-desc)))]
     [(code)
-     (define insp (vm-eval `(inspect/object ',val)))
-     (define code-desc (describe-live-code insp (make-hasheq)))
-     (vector 'ENTRY 'visit-revisit code-desc)]
+     (with-handlers ([(lambda (_) #t) (lambda (e) (format "vfasl result: ~a"
+                                                          (if (exn? e) (exn-message e) e)))])
+       (define insp (vm-eval `(inspect/object ',val)))
+       (define code-desc (describe-live-code insp (make-hasheq)))
+       (vector 'ENTRY 'visit-revisit code-desc))]
     [else
-     (with-handlers ([exn:fail? (lambda (e) (format "vfasl result: ~a" (exn-message e)))])
+     (with-handlers ([(lambda (_) #t) (lambda (e) (format "vfasl result: ~a"
+                                                         (if (exn? e) (exn-message e) e)))])
        (vm-eval `(parameterize ([print-level 4] [print-length 10])
                    (format "~s" ',val))))]))
 
 (define (describe-live-code code-insp seen)
-  (define code-value (code-insp 'value))
+  (define code-value
+    (with-handlers ([(lambda (_) #t) (lambda (e) #f)])
+      (code-insp 'value)))
   (cond
+    [(not code-value)
+     ;; Inspector failed — return minimal stub
+     (vector 'CODE 0 0 #f 0 #f '() #"" 0 #())]
     [(hash-ref seen code-value #f)
      ;; Cycle: return stub
      (vector 'CODE 0 0
-             (with-handlers ([exn:fail? (lambda (e) #f)]) (code-insp 'name))
+             (with-handlers ([(lambda (_) #t) (lambda (e) #f)]) (code-insp 'name))
              0 #f '() #"" 0 #())]
     [else
      (hash-set! seen code-value #t)
      (define name
-       (with-handlers ([exn:fail? (lambda (e) #f)])
+       (with-handlers ([(lambda (_) #t) (lambda (e) #f)])
          (code-insp 'name)))
      (define arity-mask
-       (with-handlers ([exn:fail? (lambda (e) 0)])
+       (with-handlers ([(lambda (_) #t) (lambda (e) 0)])
          (code-insp 'arity-mask)))
      (define free-count
-       (with-handlers ([exn:fail? (lambda (e) 0)])
+       (with-handlers ([(lambda (_) #t) (lambda (e) 0)])
          (code-insp 'free-count)))
      (define bstr (extract-machine-code code-value))
      (define relocs-vec (build-reloc-descriptions code-insp seen))
@@ -267,7 +290,7 @@
              (bytes-length bstr) relocs-vec)]))
 
 (define (extract-machine-code code-value)
-  (with-handlers ([exn:fail? (lambda (e) #"")])
+  (with-handlers ([(lambda (_) #t) (lambda (e) #"")])
     (vm-eval
      `(let ([code ',code-value]
             [memcpy ',(lambda (to from len)
@@ -282,9 +305,9 @@
           bstr)))))
 
 (define (build-reloc-descriptions code-insp seen)
-  (with-handlers ([exn:fail? (lambda (e) #())])
+  (with-handlers ([(lambda (_) #t) (lambda (e) #())])
     (define pairs
-      (with-handlers ([exn:fail? (lambda (e) '())])
+      (with-handlers ([(lambda (_) #t) (lambda (e) '())])
         ((code-insp 'reloc+offset) 'value)))
     (list->vector
      (for/list ([ro (in-list pairs)])
@@ -295,19 +318,19 @@
 
 (define (describe-reloc-value val seen)
   (define type
-    (with-handlers ([exn:fail? (lambda (e) 'other)])
+    (with-handlers ([(lambda (_) #t) (lambda (e) 'other)])
       (vm-eval `(cond
                   [(procedure? ',val) 'procedure]
                   [(($primitive $code?) ',val) 'code]
                   [else 'other]))))
   (case type
     [(procedure)
-     (with-handlers ([exn:fail? (lambda (e) val)])
+     (with-handlers ([(lambda (_) #t) (lambda (e) val)])
        (define insp (vm-eval `(inspect/object ',val)))
        (define code-insp (insp 'code))
        (vector 'CLOSURE 0 (describe-live-code code-insp seen)))]
     [(code)
-     (with-handlers ([exn:fail? (lambda (e) val)])
+     (with-handlers ([(lambda (_) #t) (lambda (e) val)])
        (define insp (vm-eval `(inspect/object ',val)))
        (describe-live-code insp seen))]
     [else val]))
