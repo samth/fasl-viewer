@@ -1178,3 +1178,37 @@
     (check-false (style-italic? (car p))
                  (format "assembly line should not be italic: ~a"
                          (substring (cdr p) 0 (min 60 (string-length (cdr p))))))))
+
+;; -------------------------------------------------------------------
+;; Register annotation tests
+
+(test-case "x86_64 register annotations"
+  ;; Core Scheme registers
+  (check-equal? (annotate-asm-registers "(mov r15 #x418180bd)") " ; cp")
+  (check-equal? (annotate-asm-registers "(mov rbp #x2)") " ; ac0")
+  (check-equal? (annotate-asm-registers "(jmp (mem64+ r13 #x0))") " ; sfp")
+  (check-equal? (annotate-asm-registers "(cmp rbp #x3)") " ; ac0")
+  (check-equal? (annotate-asm-registers "(add r9 #x40)") " ; ap")
+  (check-equal? (annotate-asm-registers "(mov r12 #x6)") " ; xp")
+  (check-equal? (annotate-asm-registers "(mov rax rbx)") " ; td, ts")
+  ;; Thread context access pattern
+  (check-equal? (annotate-asm-registers "(mov rbx (mem64+ r14 #x150))") " ; tc, td")
+  ;; C args filtered out
+  (check-equal? (annotate-asm-registers "(mov r8 #xbb0)") "")
+  (check-equal? (annotate-asm-registers "(test r8b #x7)") "")
+  (check-equal? (annotate-asm-registers "(mov rdi #x44c580cd)") "")
+  ;; No registers
+  (check-equal? (annotate-asm-registers "(nop)") "")
+  (check-equal? (annotate-asm-registers "(data)") ""))
+
+(test-case "arm64 register annotations"
+  (check-equal? (annotate-asm-registers "(mov x26 #x100)") " ; cp")
+  (check-equal? (annotate-asm-registers "(mov x23 #x2)") " ; ac0")
+  (check-equal? (annotate-asm-registers "(ldr x24 (mem+ x19 #x50))") " ; tc, xp")
+  (check-equal? (annotate-asm-registers "(str x25 (mem+ x20 #x0))") " ; sfp, td")
+  (check-equal? (annotate-asm-registers "(add x21 x21 #x40)") " ; ap")
+  ;; arm64 C args filtered out
+  (check-equal? (annotate-asm-registers "(mov x0 #x42)") "")
+  (check-equal? (annotate-asm-registers "(mov x7 x1)") "")
+  ;; arm64 trap register
+  (check-equal? (annotate-asm-registers "(cmp x22 #x0)") " ; trap"))

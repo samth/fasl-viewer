@@ -17,6 +17,7 @@
 (provide build-tree
          flatten-tree
          render-view
+         annotate-asm-registers
 
          ;; Tree node structure
          (struct-out tnode)
@@ -429,6 +430,58 @@
 (define detail-style (make-style #:foreground fg-bright-white #:italic #t))
 (define asm-hex-style (make-style #:foreground fg-white))
 (define asm-sexp-style (make-style #:foreground fg-cyan))
+(define asm-annot-style (make-style #:foreground fg-bright-black))
+
+;; Chez Scheme register conventions.
+;; x86_64 and arm64 register names don't overlap, so one table works for both.
+(define chez-register-names
+  (hash ;; x86_64 (ta6le, a6le, etc.)
+        "rbp"  "ac0"     ; accumulator 0
+        "r10"  "ac1"     ; accumulator 1
+        "r12"  "xp"      ; extra pointer
+        "r11"  "yp"      ; y pointer
+        "r15"  "cp"      ; continuation pointer
+        "rax"  "ts"      ; temp scheme / C return
+        "rbx"  "td"      ; temp data
+        "r14"  "tc"      ; thread context
+        "r13"  "sfp"     ; scheme frame pointer
+        "r9"   "ap"      ; allocation pointer
+        "r14b" "tc"  "r13b" "sfp"  "r9b" "ap"
+        "r8b"  "Carg5"  "r8" "Carg5"
+        "rdi"  "Carg1"  "rsi" "Carg2"  "rdx" "Carg3"
+        "rcx"  "Carg4"  "rsp" "sp"
+        ;; arm64 (tarm64le, arm64le, etc.)
+        "x19"  "tc"      ; thread context
+        "x20"  "sfp"     ; scheme frame pointer
+        "x21"  "ap"      ; allocation pointer
+        "x22"  "trap"    ; trap register
+        "x23"  "ac0"     ; accumulator 0
+        "x24"  "xp"      ; extra pointer
+        "x25"  "td"      ; temp data
+        "x26"  "cp"      ; continuation pointer
+        "x8"   "ts"      ; temp scheme / C return
+        "x0"   "Carg1"  "x1" "Carg2"  "x2" "Carg3"
+        "x3"   "Carg4"  "x4" "Carg5"  "x5" "Carg6"
+        "x6"   "Carg7"  "x7" "Carg8"))
+
+;; Annotate an assembly sexp string with Chez register roles.
+;; Returns the annotation string (empty if no interesting registers).
+(define (annotate-asm-registers sexp-str)
+  (define regs-found
+    (for/list ([(hw-name chez-name) (in-hash chez-register-names)]
+               #:when (regexp-match? (pregexp (string-append "\\b" hw-name "\\b")) sexp-str))
+      (cons hw-name chez-name)))
+  ;; Deduplicate by chez-name, keep only non-C-arg registers for brevity
+  (define dominated (list->set (list "Carg1" "Carg2" "Carg3" "Carg4" "Carg5"
+                                     "Carg6" "Carg7" "Carg8" "sp")))
+  (define interesting
+    (remove-duplicates
+     (for/list ([p (in-list regs-found)]
+                #:unless (set-member? dominated (cdr p)))
+       (cdr p))))
+  (if (null? interesting)
+      ""
+      (string-append " ; " (string-join (sort interesting string<?) ", "))))
 (define index-style (make-style #:foreground fg-bright-black #:bold #t))
 
 (define kind-colors (hasheq 'fasl fg-blue 'vfasl fg-magenta))
@@ -520,13 +573,25 @@
            => (lambda (m)
                 (define hex-part (string-append indent arrow (second m)))
                 (define sexp-part (third m))
+                ;; Strip any existing "; ..." comment from sexp-part before annotating
+                (define-values (sexp-clean existing-comment)
+                  (let ([cm (regexp-match #rx"^(.*?)(\\s+;\\s+.*)$" sexp-part)])
+                    (if cm (values (second cm) (third cm)) (values sexp-part ""))))
+                (define annot (annotate-asm-registers sexp-clean))
+                (define comment (string-append existing-comment annot))
                 (define hex-len (string-length hex-part))
-                (define sexp-len (string-length sexp-part))
-                (define total (+ hex-len sexp-len))
+                (define sexp-clean-len (string-length sexp-clean))
+                (define comment-len (string-length comment))
+                (define total (+ hex-len sexp-clean-len comment-len))
                 (define pad (max 0 (- width total)))
-                (hcat 'left
-                      (styled asm-hex-style (text hex-part))
-                      (styled asm-sexp-style (text (string-append sexp-part (make-string pad #\space))))))]
+                (if (equal? comment "")
+                    (hcat 'left
+                          (styled asm-hex-style (text hex-part))
+                          (styled asm-sexp-style (text (string-append sexp-clean (make-string pad #\space)))))
+                    (hcat 'left
+                          (styled asm-hex-style (text hex-part))
+                          (styled asm-sexp-style (text sexp-clean))
+                          (styled asm-annot-style (text (string-append comment (make-string pad #\space)))))))]
           ;; RELOC lines
           [(regexp-match? #rx"^RELOC " label)
            (styled asm-hex-style (text padded))]
