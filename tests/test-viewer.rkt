@@ -5,6 +5,9 @@
          racket/list
          racket/string
          racket/hash
+         racket/path
+         racket/system
+         racket/runtime-path
          setup/dirs
          kettle
          kettle/test
@@ -21,14 +24,24 @@
 (define petite-fasl-path "/home/samth/sw/ChezScheme/ta6le/boot/ta6le/petite.boot")
 (define petite-fasl-available? (file-exists? petite-fasl-path))
 (define racket-exe-path (build-path (find-console-bin-dir) "racket"))
-(define zo-path (build-path (find-collects-dir) "racket" "compiled" "main_rkt.zo"))
+;; Compile a small fixture to get a .zo for testing
+(define-runtime-path zo-fixture-src "zo-fixture.rkt")
+(define zo-path
+  (let ([zo (build-path (path-only zo-fixture-src) "compiled" "zo-fixture_rkt.zo")])
+    (unless (file-exists? zo)
+      (system* racket-exe-path "-l" "raco" "make" (path->string zo-fixture-src)))
+    (and (file-exists? zo) zo)))
+(define zo-available? (and zo-path #t))
 
-;; Skip tests when local boot files are not available (e.g., in CI)
+;; Skip tests when required files are not available (e.g., in CI)
 (define-syntax-rule (test-case/vfasl name body ...)
   (when petite-vfasl-available?
     (test-case name body ...)))
 (define-syntax-rule (test-case/fasl name body ...)
   (when petite-fasl-available?
+    (test-case name body ...)))
+(define-syntax-rule (test-case/zo name body ...)
+  (when zo-available?
     (test-case name body ...)))
 
 ;; -------------------------------------------------------------------
@@ -46,13 +59,13 @@
   (check-equal? (length tree) 1)
   (check-true (tnode-expandable? (first tree))))
 
-(test-case "build-tree produces a single root for zo file"
+(test-case/zo "build-tree produces a single root for zo file"
   (define pf (parse-file zo-path))
   (define tree (build-tree pf))
   (check-equal? (length tree) 1)
   (check-true (tnode-expandable? (first tree))))
 
-(test-case "zo file tree has module children"
+(test-case/zo "zo file tree has module children"
   (define pf (parse-file zo-path))
   (define tree (build-tree pf))
   (define root (first tree))
@@ -62,7 +75,7 @@
   ;; First child should be a Module node
   (check-regexp-match #rx"Module" (tnode-label (first (tnode-children root)))))
 
-(test-case "zo module has phase/metadata children"
+(test-case/zo "zo module has phase/metadata children"
   (define pf (parse-file zo-path))
   (define tree (build-tree pf))
   (define root (first tree))
@@ -75,7 +88,7 @@
                       (tnode-children mod-node))
               "module should have a Phase linklet child"))
 
-(test-case "zo phase linklet has decompiled details"
+(test-case/zo "zo phase linklet has decompiled details"
   (define pf (parse-file zo-path))
   (define tree (build-tree pf))
   (define root (first tree))
@@ -89,7 +102,7 @@
   (check-true (> (length (tnode-details phase-node)) 0)
               "phase linklet should have decompiled detail lines"))
 
-(test-case "zo node IDs are unique"
+(test-case/zo "zo node IDs are unique"
   (define pf (parse-file zo-path))
   (define tree (build-tree pf))
   (define all-expanded
