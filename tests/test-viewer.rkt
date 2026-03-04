@@ -5,6 +5,7 @@
          racket/list
          racket/string
          racket/hash
+         setup/dirs
          kettle
          kettle/test
          "../parse.rkt"
@@ -16,14 +17,24 @@
 ;; Test data: parse real files for realistic testing
 
 (define petite-vfasl-path "/home/samth/sw/ChezScheme/experiments/petite-vfasl.boot")
+(define petite-vfasl-available? (file-exists? petite-vfasl-path))
 (define petite-fasl-path "/home/samth/sw/ChezScheme/ta6le/boot/ta6le/petite.boot")
-(define racket-exe-path "/home/samth/sw/plt/racket/bin/racket")
-(define zo-path "/home/samth/sw/plt/racket/collects/racket/compiled/main_rkt.zo")
+(define petite-fasl-available? (file-exists? petite-fasl-path))
+(define racket-exe-path (build-path (find-console-bin-dir) "racket"))
+(define zo-path (build-path (find-collects-dir) "racket" "compiled" "main_rkt.zo"))
+
+;; Skip tests when local boot files are not available (e.g., in CI)
+(define-syntax-rule (test-case/vfasl name body ...)
+  (when petite-vfasl-available?
+    (test-case name body ...)))
+(define-syntax-rule (test-case/fasl name body ...)
+  (when petite-fasl-available?
+    (test-case name body ...)))
 
 ;; -------------------------------------------------------------------
 ;; Tree building tests
 
-(test-case "build-tree produces a single root for chez boot file"
+(test-case/vfasl "build-tree produces a single root for chez boot file"
   (define pf (parse-file petite-vfasl-path))
   (define tree (build-tree pf))
   (check-equal? (length tree) 1)
@@ -93,7 +104,7 @@
 ;; -------------------------------------------------------------------
 ;; Unique node IDs
 
-(test-case "node IDs are unique within a chez boot file"
+(test-case/vfasl "node IDs are unique within a chez boot file"
   (define pf (parse-file petite-vfasl-path))
   (define tree (build-tree pf))
   (define all-expanded
@@ -139,13 +150,13 @@
 ;; -------------------------------------------------------------------
 ;; Flatten tree tests
 
-(test-case "collapsed tree has one item"
+(test-case/vfasl "collapsed tree has one item"
   (define pf (parse-file petite-vfasl-path))
   (define tree (build-tree pf))
   (define items (flatten-tree tree (seteq)))
   (check-equal? (length items) 1))
 
-(test-case "expanding root shows children"
+(test-case/vfasl "expanding root shows children"
   (define pf (parse-file petite-vfasl-path))
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
@@ -156,7 +167,7 @@
   ;; Children should be at depth 1
   (check-true (andmap (lambda (i) (>= (flat-item-depth i) 1)) (rest items))))
 
-(test-case "expanding a vfasl object shows detail lines"
+(test-case/vfasl "expanding a vfasl object shows detail lines"
   (define pf (parse-file petite-vfasl-path))
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
@@ -181,7 +192,7 @@
 ;; -------------------------------------------------------------------
 ;; Cursor position stability during expand/collapse
 
-(test-case "toggle-expand keeps cursor on same item"
+(test-case/vfasl "toggle-expand keeps cursor on same item"
   (define pf (parse-file petite-vfasl-path))
   (define a0 (make-app pf))
   ;; Expand root
@@ -199,7 +210,7 @@
   ;; Item at cursor should be the root
   (check-equal? (flat-item-id (list-ref (app-items a1) 0)) (tnode-id (first (app-tree a1)))))
 
-(test-case "expand then collapse keeps cursor on same item"
+(test-case/vfasl "expand then collapse keeps cursor on same item"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -219,7 +230,7 @@
   (check-equal? (app-cursor a2) 0)
   (check-equal? (length (app-items a2)) 1))
 
-(test-case "expanding item mid-list keeps cursor on same item"
+(test-case/vfasl "expanding item mid-list keeps cursor on same item"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -253,7 +264,7 @@
                 (- cursor-before scroll-before)
                 "screen row should be the same after expand"))
 
-(test-case "collapsing item mid-list keeps cursor on same item"
+(test-case/vfasl "collapsing item mid-list keeps cursor on same item"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -285,14 +296,14 @@
 ;; -------------------------------------------------------------------
 ;; Fasl inner info tests
 
-(test-case "fasl objects have inner-info parsed"
+(test-case/fasl "fasl objects have inner-info parsed"
   (define pf (parse-file petite-fasl-path))
   (define boot (parsed-file-data pf))
   (define objects (chez-boot-file-objects boot))
   (define with-info (filter fasl-object-inner-info objects))
   (check-true (> (length with-info) 0) "should parse inner-info for some objects"))
 
-(test-case "fasl inner info identifies closure type"
+(test-case/fasl "fasl inner info identifies closure type"
   (define pf (parse-file petite-fasl-path))
   (define boot (parsed-file-data pf))
   (define objects (chez-boot-file-objects boot))
@@ -303,7 +314,7 @@
             objects))
   (check-true (> (length closures) 0) "should find closure objects"))
 
-(test-case "fasl inner info identifies immediate type"
+(test-case/fasl "fasl inner info identifies immediate type"
   (define pf (parse-file petite-fasl-path))
   (define boot (parsed-file-data pf))
   (define objects (chez-boot-file-objects boot))
@@ -314,7 +325,7 @@
             objects))
   (check-true (> (length immediates) 0) "should find immediate objects"))
 
-(test-case "fasl inner info shows graph counts"
+(test-case/fasl "fasl inner info shows graph counts"
   (define pf (parse-file petite-fasl-path))
   (define boot (parsed-file-data pf))
   (define objects (chez-boot-file-objects boot))
@@ -325,7 +336,7 @@
             objects))
   (check-true (> (length with-graph) 0) "should find objects with graph headers"))
 
-(test-case "fasl objects show inner type in label"
+(test-case/fasl "fasl objects show inner type in label"
   (define pf (parse-file petite-fasl-path))
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
@@ -335,7 +346,7 @@
                      items)
               "should show [closure] in object labels"))
 
-(test-case "fasl objects with graph info are expandable"
+(test-case/fasl "fasl objects with graph info are expandable"
   (define pf (parse-file petite-fasl-path))
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
@@ -348,7 +359,7 @@
   (check-true (> (length expandable-fasl) 0)
               "fasl objects with graph info should be expandable"))
 
-(test-case "expanding fasl object shows graph details"
+(test-case/fasl "expanding fasl object shows graph details"
   (define pf (parse-file petite-fasl-path))
   (define tree (build-tree pf))
   (define root-id (tnode-id (first tree)))
@@ -372,7 +383,7 @@
 ;; -------------------------------------------------------------------
 ;; Search tests
 
-(test-case "/ enters search mode"
+(test-case/fasl "/ enters search mode"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -387,7 +398,7 @@
   (check-true (app-search-mode? a))
   (check-equal? (app-search-query a) ""))
 
-(test-case "search jumps to matching item"
+(test-case/fasl "search jumps to matching item"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -406,7 +417,7 @@
   (define item (list-ref (app-items a) (app-cursor a)))
   (check-regexp-match #rx"[Rr]ecord" (flat-item-label item)))
 
-(test-case "enter confirms search, escape cancels"
+(test-case/fasl "enter confirms search, escape cancels"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -436,7 +447,7 @@
   (check-false (app-search-mode? a2))
   (check-equal? (app-cursor a2) cursor-after-confirm "escape should restore cursor"))
 
-(test-case "n finds next match, N finds previous"
+(test-case/fasl "n finds next match, N finds previous"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -466,7 +477,7 @@
   (define a3 (test-program-value tp))
   (check-equal? (app-cursor a3) first-match "N should go back to first match"))
 
-(test-case "search bar appears in view"
+(test-case/fasl "search bar appears in view"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -518,7 +529,7 @@
 ;; -------------------------------------------------------------------
 ;; Navigation tests
 
-(test-case "j moves cursor down"
+(test-case/vfasl "j moves cursor down"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -531,7 +542,7 @@
   (test-program-press tp #\j)
   (check-equal? (app-cursor (test-program-value tp)) 1))
 
-(test-case "k moves cursor up"
+(test-case/vfasl "k moves cursor up"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -546,7 +557,7 @@
   (test-program-press tp #\k)
   (check-equal? (app-cursor (test-program-value tp)) 1))
 
-(test-case "k at top stays at 0"
+(test-case/vfasl "k at top stays at 0"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -558,7 +569,7 @@
   (test-program-press tp #\k)
   (check-equal? (app-cursor (test-program-value tp)) 0))
 
-(test-case "g goes to top"
+(test-case/vfasl "g goes to top"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -573,7 +584,7 @@
   (test-program-press tp #\g)
   (check-equal? (app-cursor (test-program-value tp)) 0))
 
-(test-case "G goes to bottom"
+(test-case/vfasl "G goes to bottom"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -587,7 +598,7 @@
   (define a (test-program-value tp))
   (check-equal? (app-cursor a) (sub1 (length (app-items a)))))
 
-(test-case "l expands and h collapses"
+(test-case/vfasl "l expands and h collapses"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -605,7 +616,7 @@
   (define a2 (test-program-value tp))
   (check-false (set-member? (app-expanded a2) (tnode-id (first (app-tree a2))))))
 
-(test-case "h on non-expanded item moves to parent"
+(test-case/vfasl "h on non-expanded item moves to parent"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -623,7 +634,7 @@
   (test-program-press tp #\h)
   (check-equal? (app-cursor (test-program-value tp)) 0))
 
-(test-case "q quits"
+(test-case/vfasl "q quits"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -638,7 +649,7 @@
 ;; -------------------------------------------------------------------
 ;; View rendering tests
 
-(test-case "view contains file name"
+(test-case/vfasl "view contains file name"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -649,7 +660,7 @@
                            #:height 30))
   (check-test-program-contains tp "petite-vfasl.boot"))
 
-(test-case "view shows expand arrow"
+(test-case/vfasl "view shows expand arrow"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -665,7 +676,7 @@
   ;; Expanded: down-pointing arrow
   (check-test-program-contains tp "▾"))
 
-(test-case "view shows vfasl details when expanded"
+(test-case/vfasl "view shows vfasl details when expanded"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -684,7 +695,7 @@
   (check-regexp-match #rx"code" view-str)
   (check-regexp-match #rx"data:" view-str))
 
-(test-case "view shows footer with position"
+(test-case/vfasl "view shows footer with position"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -695,7 +706,7 @@
                            #:height 30))
   (check-test-program-contains tp "1/1"))
 
-(test-case "window resize updates dimensions"
+(test-case/vfasl "window resize updates dimensions"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -712,7 +723,7 @@
 ;; -------------------------------------------------------------------
 ;; Describe-on-expand tests
 
-(test-case "expanding fasl object auto-loads description"
+(test-case/fasl "expanding fasl object auto-loads description"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -730,7 +741,7 @@
   (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
   (check-true (set-member? (app-expanded a) 'o0) "o0 should be auto-expanded"))
 
-(test-case "collapse and re-expand fasl object reuses cached description"
+(test-case/fasl "collapse and re-expand fasl object reuses cached description"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -757,7 +768,7 @@
   (define a3 (test-program-value tp))
   (check-true (set-member? (app-expanded a3) 'o0) "should be re-expanded"))
 
-(test-case "expanding vfasl object auto-loads description"
+(test-case/vfasl "expanding vfasl object auto-loads description"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -784,7 +795,7 @@
   (check-false (hash-empty? (app-descriptions a)) "description should be loaded")
   (check-true (set-member? (app-expanded a) id) "vfasl node should be expanded"))
 
-(test-case "expanding vfasl procedure creates CODE children"
+(test-case/vfasl "expanding vfasl procedure creates CODE children"
   (define pf (parse-file petite-vfasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -815,7 +826,7 @@
   (check-true (pair? node-children) "should have CODE children")
   (check-regexp-match #rx"^CODE" (tnode-label (first node-children))))
 
-(test-case "expanding header node does not trigger describe"
+(test-case/fasl "expanding header node does not trigger describe"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -830,7 +841,7 @@
   (define a (test-program-value tp))
   (check-true (hash-empty? (app-descriptions a)) "expanding header should not trigger describe"))
 
-(test-case "expanding fasl closure creates CODE children"
+(test-case/fasl "expanding fasl closure creates CODE children"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -861,7 +872,7 @@
   ;; First child should be labeled as top-level CODE
   (check-regexp-match #rx"^CODE .* top-level" (tnode-label (first node-children))))
 
-(test-case "expanding CODE child shows assembly lines"
+(test-case/fasl "expanding CODE child shows assembly lines"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -906,7 +917,7 @@
             (app-items a2)))
   (check-true (> (length detail-items) 0) "should have assembly detail lines"))
 
-(test-case "collapse after expand-describe keeps description cached"
+(test-case/fasl "collapse after expand-describe keeps description cached"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -946,7 +957,7 @@
 ;; -------------------------------------------------------------------
 ;; Comprehensive vfasl describe tests
 
-(test-case "all petite-vfasl.boot entries describe without errors"
+(test-case/vfasl "all petite-vfasl.boot entries describe without errors"
   (define result (describe-boot-file-entries petite-vfasl-path))
   (check-true (> (vector-length result) 0) "should have entries")
   (for ([i (in-range (vector-length result))])
@@ -990,7 +1001,7 @@
                    (format "scheme entry ~a should not be an error: ~a"
                            i (substring d 0 (min 100 (string-length d))))))))
 
-(test-case "vfasl description vectors have correct ENTRY structure"
+(test-case/vfasl "vfasl description vectors have correct ENTRY structure"
   (define result (describe-boot-file-entries petite-vfasl-path))
   (define vfasl-descs
     (for/list ([i (in-range (vector-length result))]
@@ -1001,7 +1012,7 @@
     (check-equal? (vector-ref desc 0) 'ENTRY "tag should be ENTRY")
     (check-true (>= (vector-length desc) 3) "ENTRY should have at least 3 elements")))
 
-(test-case "vfasl closure descriptions contain CODE"
+(test-case/vfasl "vfasl closure descriptions contain CODE"
   (define result (describe-boot-file-entries petite-vfasl-path))
   (define closure-descs
     (for/list ([i (in-range (vector-length result))]
@@ -1019,7 +1030,7 @@
     (check-true (vector? code) "CLOSURE should contain CODE vector")
     (check-equal? (vector-ref code 0) 'CODE "inner should be CODE")))
 
-(test-case "vfasl CODE vectors have assembly after disassembly"
+(test-case/vfasl "vfasl CODE vectors have assembly after disassembly"
   (define result (describe-boot-file-entries petite-vfasl-path))
   ;; Find a closure description
   (define closure-desc
@@ -1069,7 +1080,7 @@
   (check-true (string? desc) "fixnum should produce string description")
   (check-regexp-match #rx"42" desc))
 
-(test-case "expand every vfasl entry in petite-vfasl.boot works in TUI"
+(test-case/vfasl "expand every vfasl entry in petite-vfasl.boot works in TUI"
   ;; Exercises the full TUI pipeline for each vfasl entry
   (define pf (parse-file petite-vfasl-path))
   (define tp
@@ -1131,7 +1142,7 @@
   (or (regexp-match? #rx" +[0-9a-f]+: +[0-9a-f][0-9a-f][0-9a-f]" str)
       (regexp-match? #rx"RELOC " str)))
 
-(test-case "assembly lines are not italic in expanded fasl object"
+(test-case/fasl "assembly lines are not italic in expanded fasl object"
   (define pf (parse-file petite-fasl-path))
   (define tp
     (make-test-program/run (make-app pf)
@@ -1212,3 +1223,61 @@
   (check-equal? (annotate-asm-registers "(mov x7 x1)") "")
   ;; arm64 trap register
   (check-equal? (annotate-asm-registers "(cmp x22 #x0)") " ; trap"))
+
+;; -------------------------------------------------------------------
+;; Legend toggle tests
+
+(test-case/vfasl "? key toggles legend on and off"
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 80
+                           #:height 24))
+  (check-false (app-show-legend? (test-program-value tp)))
+  (test-program-press tp #\?)
+  (check-true (app-show-legend? (test-program-value tp)))
+  (test-program-press tp #\?)
+  (check-false (app-show-legend? (test-program-value tp))))
+
+(test-case/vfasl "legend renders as overlay on right side"
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 120
+                           #:height 40))
+  (test-program-press tp 'enter) ; expand root for some content
+  (test-program-press tp #\?)
+  (define a (test-program-value tp))
+  (check-true (app-show-legend? a))
+  (define img (app-to-view a))
+  (define pairs (collect-styled-texts img))
+  ;; Legend box should contain bold-styled box-drawing chars
+  (define legend-texts (filter (lambda (p) (style-bold? (car p))) pairs))
+  (define legend-strs (map cdr legend-texts))
+  ;; Should find the legend title border
+  (check-true (for/or ([s (in-list legend-strs)])
+                (string-contains? s "Register Legend"))
+              "legend overlay should contain 'Register Legend'")
+  ;; Should also still have non-bold content (main tree) visible
+  (define non-bold (filter (lambda (p) (not (style-bold? (car p)))) pairs))
+  (check-true (> (length non-bold) 0) "main content should still be visible alongside legend"))
+
+(test-case/vfasl "Escape dismisses legend"
+  (define pf (parse-file petite-vfasl-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 80
+                           #:height 24))
+  (test-program-press tp #\?)
+  (check-true (app-show-legend? (test-program-value tp)))
+  (test-program-press tp 'escape)
+  (check-false (app-show-legend? (test-program-value tp))))

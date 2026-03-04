@@ -1,0 +1,23 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Bogdanp/setup-racket@v1.12
+        with:
+          architecture: x64
+          distribution: full
+          version: stable
+      - name: Install package
+        run: raco pkg install --auto --name fasl-viewer
+      - name: Check package dependencies
+        run: raco setup --check-pkg-deps --pkgs fasl-viewer
+      - name: Run tests
+        run: raco test -y tests/

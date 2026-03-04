@@ -431,6 +431,7 @@
 (define asm-hex-style (make-style #:foreground fg-white))
 (define asm-sexp-style (make-style #:foreground fg-cyan))
 (define asm-annot-style (make-style #:foreground fg-bright-black))
+(define asm-annot-col 56) ; column where register annotations start
 
 ;; Chez Scheme register conventions.
 ;; x86_64 and arm64 register names don't overlap, so one table works for both.
@@ -469,7 +470,8 @@
 (define (annotate-asm-registers sexp-str)
   (define regs-found
     (for/list ([(hw-name chez-name) (in-hash chez-register-names)]
-               #:when (regexp-match? (pregexp (string-append "\\b" hw-name "\\b")) sexp-str))
+               ;; (?<!#) prevents matching inside hex literals like #x8
+               #:when (regexp-match? (pregexp (string-append "(?<!#)\\b" hw-name "\\b")) sexp-str))
       (cons hw-name chez-name)))
   ;; Deduplicate by chez-name, keep only non-C-arg registers for brevity
   (define dominated (list->set (list "Carg1" "Carg2" "Carg3" "Carg4" "Carg5"
@@ -494,11 +496,22 @@
 
 (define (render-view items cursor scroll width height file-path total-items
                      #:search-mode? [search-mode? #f]
-                     #:search-query [search-query ""])
+                     #:search-query [search-query ""]
+                     #:show-legend? [show-legend? #f]
+                     #:arch [arch 'both])
   (define content-height (- height 2)) ; header + footer
   (define visible
     (take (drop items (min scroll (length items)))
           (min content-height (max 0 (- (length items) scroll)))))
+
+  ;; Legend overlay computation
+  (define legend-box (if show-legend? (build-legend-box arch) '()))
+  (define legend-w (if (pair? legend-box) (string-length (first legend-box)) 0))
+  ;; Only show overlay if terminal is wide enough (need at least 30 cols for main content)
+  (define show-overlay? (and show-legend? (> width (+ legend-w 30))))
+  (define legend-h (length legend-box))
+  (define legend-start-row
+    (if show-overlay? (max 0 (quotient (- content-height legend-h) 2)) 0))
 
   ;; Header bar
   (define basename (let ([parts (regexp-split #rx"/" file-path)]) (last parts)))
@@ -506,17 +519,38 @@
   (define hdr-pad (make-string (max 0 (- width (string-length hdr-text))) #\space))
   (define header-img (styled header-style (text (string-append hdr-text hdr-pad))))
 
-  ;; Content lines
+  ;; Content lines (with optional legend overlay on right side)
   (define line-imgs
     (for/list ([item (in-list visible)]
                [vi (in-naturals)])
       (define actual-idx (+ scroll vi))
       (define at-cursor? (= actual-idx cursor))
-      (render-line item width at-cursor?)))
+      (define legend-row (- vi legend-start-row))
+      (cond
+        [(and show-overlay?
+              (>= legend-row 0)
+              (< legend-row legend-h))
+         (define main-w (- width legend-w))
+         (define main-img (render-line item main-w at-cursor?))
+         (define legend-line-str (list-ref legend-box legend-row))
+         (hcat 'left main-img (styled legend-style (text legend-line-str)))]
+        [else
+         (render-line item width at-cursor?)])))
 
-  ;; Pad remaining lines
+  ;; Pad remaining lines (with legend overlay if needed)
   (define pad-count (max 0 (- content-height (length line-imgs))))
-  (define pad-imgs (make-list pad-count (text "")))
+  (define pad-imgs
+    (for/list ([pi (in-range pad-count)])
+      (define vi (+ (length line-imgs) pi))
+      (define legend-row (- vi legend-start-row))
+      (cond
+        [(and show-overlay?
+              (>= legend-row 0)
+              (< legend-row legend-h))
+         (define main-pad (make-string (- width legend-w) #\space))
+         (define legend-line-str (list-ref legend-box legend-row))
+         (hcat 'left (text main-pad) (styled legend-style (text legend-line-str)))]
+        [else (text "")])))
 
   ;; Footer bar
   (define footer-img
@@ -531,11 +565,76 @@
              100
              (min 100 (inexact->exact (round (* 100 (/ (+ cursor 1) total-items)))))))
        (define footer-text
-         (format " ~a/~a  ~a%%  [j/k]move [/]search [q]quit " (add1 cursor) total-items pct))
+         (format " ~a/~a  ~a%%  [j/k]move [/]search [?]legend [q]quit " (add1 cursor) total-items pct))
        (define footer-pad (make-string (max 0 (- width (string-length footer-text))) #\space))
        (styled footer-style (text (string-append footer-text footer-pad)))]))
 
   (apply vcat 'left header-img (append line-imgs pad-imgs (list footer-img))))
+
+(define legend-style (make-style #:bold #t))
+
+;; Build the legend popup box for a specific architecture.
+;; arch is 'x86_64, 'arm64, or 'both.
+(define (build-legend-box arch)
+  (define (reg-entry reg role)
+    (string-append " " (~a #:min-width 3 #:align 'left reg) " = " (~a #:min-width 4 #:align 'left role)))
+
+  (define x86-regs
+    (list (reg-entry "rbp" "ac0")
+          (reg-entry "r10" "ac1")
+          (reg-entry "r12" "xp")
+          (reg-entry "r11" "yp")
+          (reg-entry "r15" "cp")
+          (reg-entry "r13" "sfp")
+          (reg-entry "r14" "tc")
+          (reg-entry "r9"  "ap")
+          (reg-entry "rax" "ts")
+          (reg-entry "rbx" "td")))
+
+  (define arm-regs
+    (list (reg-entry "x23" "ac0")
+          (reg-entry "x24" "xp")
+          (reg-entry "x26" "cp")
+          (reg-entry "x20" "sfp")
+          (reg-entry "x19" "tc")
+          (reg-entry "x21" "ap")
+          (reg-entry "x8"  "ts")
+          (reg-entry "x25" "td")
+          (reg-entry "x22" "trap")))
+
+  (define reg-lines
+    (case arch
+      [(x86_64) (cons " x86_64" x86-regs)]
+      [(arm64)  (cons " arm64" arm-regs)]
+      [else ; both
+       (append (cons " x86_64" x86-regs)
+               (list "")
+               (cons " arm64" arm-regs))]))
+
+  (define key-lines
+    (list " ac=accum  cp=cont ptr"
+          " sfp=frame tc=thread ctx"
+          " ap=alloc  ts=temp scheme"
+          (if (memq arch '(arm64 both))
+              " td=data   trap=trap reg"
+              " td=data   xp/yp=extra/y")))
+
+  (define body (append reg-lines (list "") key-lines
+                       (list "" " Press ? or Esc to close")))
+
+  (define inner-width (+ 2 (apply max (map string-length body))))
+  (define (pad-inner s)
+    (define len (string-length s))
+    (if (< len inner-width)
+        (string-append s (make-string (- inner-width len) #\space))
+        (substring s 0 inner-width)))
+  (define (box-line s) (string-append "│" (pad-inner s) "│"))
+
+  (define top (string-append "┌─ Register Legend "
+                             (make-string (max 0 (- inner-width 18)) #\─) "┐"))
+  (define bottom (string-append "└" (make-string inner-width #\─) "┘"))
+
+  (append (list top) (map box-line body) (list bottom)))
 
 (define (render-line item width at-cursor?)
   (match item
@@ -582,16 +681,23 @@
                 (define hex-len (string-length hex-part))
                 (define sexp-clean-len (string-length sexp-clean))
                 (define comment-len (string-length comment))
-                (define total (+ hex-len sexp-clean-len comment-len))
-                (define pad (max 0 (- width total)))
-                (if (equal? comment "")
-                    (hcat 'left
-                          (styled asm-hex-style (text hex-part))
-                          (styled asm-sexp-style (text (string-append sexp-clean (make-string pad #\space)))))
-                    (hcat 'left
-                          (styled asm-hex-style (text hex-part))
-                          (styled asm-sexp-style (text sexp-clean))
-                          (styled asm-annot-style (text (string-append comment (make-string pad #\space)))))))]
+                (cond
+                  [(equal? comment "")
+                   (define total (+ hex-len sexp-clean-len))
+                   (define pad (max 0 (- width total)))
+                   (hcat 'left
+                         (styled asm-hex-style (text hex-part))
+                         (styled asm-sexp-style (text (string-append sexp-clean (make-string pad #\space)))))]
+                  [else
+                   ;; Pad sexp to align annotations at a fixed column
+                   (define before-annot (+ hex-len sexp-clean-len))
+                   (define sexp-pad (max 1 (- asm-annot-col before-annot)))
+                   (define total (+ before-annot sexp-pad comment-len))
+                   (define trail-pad (max 0 (- width total)))
+                   (hcat 'left
+                         (styled asm-hex-style (text hex-part))
+                         (styled asm-sexp-style (text (string-append sexp-clean (make-string sexp-pad #\space))))
+                         (styled asm-annot-style (text (string-append comment (make-string trail-pad #\space)))))]))]
           ;; RELOC lines
           [(regexp-match? #rx"^RELOC " label)
            (styled asm-hex-style (text padded))]

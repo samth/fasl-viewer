@@ -37,15 +37,37 @@
          describe-cache ; (hasheq key -> (vectorof any/c))
          descriptions ; (hasheq symbol? -> (listof string?))
          base-details ; (hasheq symbol? -> (listof string?))
-         base-children) ; (hasheq symbol? -> (listof tnode?))
+         base-children ; (hasheq symbol? -> (listof tnode?))
+         show-legend?) ; #t when legend overlay is shown
   #:transparent)
+
+;; Detect architecture from parsed file: 'x86_64, 'arm64, or 'both
+(define (detect-arch pf)
+  (define data (parsed-file-data pf))
+  (define machine-str
+    (cond
+      [(chez-boot-file? data)
+       (define hdrs (chez-boot-file-headers data))
+       (and (pair? hdrs) (lookup-machine-type (boot-header-machine-type (first hdrs))))]
+      [(racket-executable? data)
+       (define boots (racket-executable-boot-files data))
+       (and (pair? boots)
+            (let ([hdrs (chez-boot-file-headers (racket-boot-entry-boot (first boots)))])
+              (and (pair? hdrs) (lookup-machine-type (boot-header-machine-type (first hdrs))))))]
+      [(zo-file? data) (zo-file-machine-type data)]
+      [else #f]))
+  (cond
+    [(not machine-str) 'both]
+    [(regexp-match? #rx"arm64" machine-str) 'arm64]
+    [(regexp-match? #rx"a6|i3|x86" machine-str) 'x86_64]
+    [else 'both]))
 
 (define (make-app pf)
   (define tree (build-tree pf))
   (define expanded (seteq)) ; start collapsed
   (define items (flatten-tree tree expanded))
   (app tree items 0 expanded 80 24 0 (parsed-file-path pf) #f "" 0
-       pf (hasheq) (hasheq) (hasheq) (hasheq)))
+       pf (hasheq) (hasheq) (hasheq) (hasheq) #f))
 
 (define (rebuild-items a)
   (define items (flatten-tree (app-tree a) (app-expanded a)))
@@ -359,40 +381,43 @@
 ;; Key dispatch
 
 (define (app-on-key a msg)
-  (cond
-    [(app-search-mode? a) (search-on-key a msg)]
-    [else
-     (match msg
-       ;; Quit
-       [(key-msg #\q _ _) (cmd a (quit-cmd))]
-       ;; Search
-       [(key-msg #\/ _ _)
-        (struct-copy app a
-                     [search-mode? #t]
-                     [search-query ""]
-                     [search-origin (app-cursor a)])]
-       ;; Next/prev match
-       [(key-msg #\n _ _) (find-next a)]
-       [(key-msg (or #\N #\p) _ _) (find-prev a)]
-       ;; Move down
-       [(key-msg (or #\j 'down) _ _) (move-cursor a 1)]
-       ;; Move up
-       [(key-msg (or #\k 'up) _ _) (move-cursor a -1)]
-       ;; Toggle expand
-       [(key-msg (or 'enter #\return #\space) _ _) (toggle-expand a)]
-       ;; Expand / move into
-       [(key-msg (or #\l 'right) _ _) (expand-current a)]
-       ;; Collapse / move to parent
-       [(key-msg (or #\h 'left) _ _) (collapse-current a)]
-       ;; Top / bottom
-       [(key-msg #\g _ _) (goto-top a)]
-       [(key-msg #\G _ _) (goto-bottom a)]
-       ;; Page down/up
-       [(key-msg 'page-down _ _) (page-down a)]
-       [(key-msg 'page-up _ _) (page-up a)]
-       [(key-msg #\d _ #t) (page-down a)] ; ctrl-d
-       [(key-msg #\u _ #t) (page-up a)] ; ctrl-u
-       [_ a])]))
+  (match* (a msg)
+    ;; Legend dismiss
+    [((? app-show-legend?) (key-msg (or #\? 'escape) _ _))
+     (struct-copy app a [show-legend? #f])]
+    ;; Search mode
+    [((? app-search-mode?) _) (search-on-key a msg)]
+    ;; Quit
+    [(_ (key-msg #\q _ _)) (cmd a (quit-cmd))]
+    ;; Legend
+    [(_ (key-msg #\? _ _)) (struct-copy app a [show-legend? #t])]
+    ;; Search
+    [(_ (key-msg #\/ _ _))
+     (struct-copy app a
+                  [search-mode? #t]
+                  [search-query ""]
+                  [search-origin (app-cursor a)])]
+    ;; Next/prev match
+    [(_ (key-msg #\n _ _)) (find-next a)]
+    [(_ (key-msg (or #\N #\p) _ _)) (find-prev a)]
+    ;; Move
+    [(_ (key-msg (or #\j 'down) _ _)) (move-cursor a 1)]
+    [(_ (key-msg (or #\k 'up) _ _)) (move-cursor a -1)]
+    ;; Toggle expand
+    [(_ (key-msg (or 'enter #\return #\space) _ _)) (toggle-expand a)]
+    ;; Expand / move into
+    [(_ (key-msg (or #\l 'right) _ _)) (expand-current a)]
+    ;; Collapse / move to parent
+    [(_ (key-msg (or #\h 'left) _ _)) (collapse-current a)]
+    ;; Top / bottom
+    [(_ (key-msg #\g _ _)) (goto-top a)]
+    [(_ (key-msg #\G _ _)) (goto-bottom a)]
+    ;; Page down/up
+    [(_ (key-msg 'page-down _ _)) (page-down a)]
+    [(_ (key-msg 'page-up _ _)) (page-up a)]
+    [(_ (key-msg #\d _ #t)) (page-down a)]  ; ctrl-d
+    [(_ (key-msg #\u _ #t)) (page-up a)]    ; ctrl-u
+    [(_ _) a]))
 
 (define (app-on-msg a msg)
   (match msg
@@ -408,7 +433,9 @@
                (app-file-path a)
                (length (app-items a))
                #:search-mode? (app-search-mode? a)
-               #:search-query (app-search-query a)))
+               #:search-query (app-search-query a)
+               #:show-legend? (app-show-legend? a)
+               #:arch (detect-arch (app-parsed a))))
 
 (module+ main
   (define file-path (command-line #:program "fasl-viewer" #:args (file) file))
