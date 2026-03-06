@@ -1294,3 +1294,209 @@
   (check-true (app-show-legend? (test-program-value tp)))
   (test-program-press tp 'escape)
   (check-false (app-show-legend? (test-program-value tp))))
+
+;; -------------------------------------------------------------------
+;; Racket executable tests (always available in CI)
+
+(test-case "racket exe: collapsed tree has one item"
+  (define pf (parse-file racket-exe-path))
+  (define tree (build-tree pf))
+  (define items (flatten-tree tree (seteq)))
+  (check-equal? (length items) 1))
+
+(test-case "racket exe: expanding root shows boot file children"
+  (define pf (parse-file racket-exe-path))
+  (define tree (build-tree pf))
+  (define root-id (tnode-id (first tree)))
+  (define items (flatten-tree tree (seteq root-id)))
+  (check-true (> (length items) 1))
+  (check-true (flat-item-expanded? (first items))))
+
+(test-case "racket exe: j/k navigation works"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (test-program-press tp #\j)
+  (check-equal? (app-cursor (test-program-value tp)) 1)
+  (test-program-press tp #\k)
+  (check-equal? (app-cursor (test-program-value tp)) 0))
+
+(test-case "racket exe: g/G navigation works"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (for ([_ (in-range 5)])
+    (test-program-press tp #\j))
+  (test-program-press tp #\g)
+  (check-equal? (app-cursor (test-program-value tp)) 0)
+  (test-program-press tp #\G)
+  (define a (test-program-value tp))
+  (check-equal? (app-cursor a) (sub1 (length (app-items a)))))
+
+(test-case "racket exe: l expands, h collapses"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp #\l)
+  (define a1 (test-program-value tp))
+  (check-true (set-member? (app-expanded a1) (tnode-id (first (app-tree a1)))))
+  (test-program-press tp #\h)
+  (define a2 (test-program-value tp))
+  (check-false (set-member? (app-expanded a2) (tnode-id (first (app-tree a2))))))
+
+(test-case "racket exe: search finds boot file entry"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (test-program-press tp #\/)
+  (for ([c (in-string "scheme")])
+    (test-program-press tp c))
+  (define a (test-program-value tp))
+  (check-true (app-search-mode? a))
+  (define item (list-ref (app-items a) (app-cursor a)))
+  (check-regexp-match #rx"[Ss]cheme" (flat-item-label item)))
+
+(test-case "racket exe: view shows file name"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (check-test-program-contains tp "racket"))
+
+(test-case "racket exe: q quits"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp #\q)
+  (check-test-program-done tp))
+
+(test-case "racket exe: ? toggles legend"
+  (define pf (parse-file racket-exe-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 80
+                           #:height 24))
+  (check-false (app-show-legend? (test-program-value tp)))
+  (test-program-press tp #\?)
+  (check-true (app-show-legend? (test-program-value tp)))
+  (test-program-press tp #\?)
+  (check-false (app-show-legend? (test-program-value tp))))
+
+;; -------------------------------------------------------------------
+;; .zo file tests (available when zo fixture is compiled)
+
+(test-case/zo "zo: collapsed tree has one item"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define items (flatten-tree tree (seteq)))
+  (check-equal? (length items) 1))
+
+(test-case/zo "zo: expanding root shows module children"
+  (define pf (parse-file zo-path))
+  (define tree (build-tree pf))
+  (define root-id (tnode-id (first tree)))
+  (define items (flatten-tree tree (seteq root-id)))
+  (check-true (> (length items) 1))
+  (check-true (flat-item-expanded? (first items))))
+
+(test-case/zo "zo: j/k navigation works"
+  (define pf (parse-file zo-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (test-program-press tp #\j)
+  (check-equal? (app-cursor (test-program-value tp)) 1)
+  (test-program-press tp #\k)
+  (check-equal? (app-cursor (test-program-value tp)) 0))
+
+(test-case/zo "zo: expand and collapse module"
+  (define pf (parse-file zo-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp 'enter) ; expand root
+  (define a0 (test-program-value tp))
+  (define items-expanded (length (app-items a0)))
+  (check-true (> items-expanded 1))
+  ;; Find a Module child by searching items
+  (define mod-idx
+    (for/or ([i (in-naturals)]
+             [item (in-list (app-items a0))])
+      (and (flat-item-expandable? item)
+           (regexp-match? #rx"Module" (flat-item-label item))
+           i)))
+  (check-not-false mod-idx "should find a Module item")
+  ;; Navigate to it and expand
+  (for ([_ (in-range mod-idx)])
+    (test-program-press tp #\j))
+  (test-program-press tp 'enter)
+  (define a1 (test-program-value tp))
+  (check-true (> (length (app-items a1)) items-expanded)
+              "expanding module should add children"))
+
+(test-case/zo "zo: view shows file name"
+  (define pf (parse-file zo-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (check-test-program-contains tp "zo-fixture"))
+
+(test-case/zo "zo: q quits"
+  (define pf (parse-file zo-path))
+  (define tp
+    (make-test-program/run (make-app pf)
+                           #:on-key app-on-key
+                           #:on-msg app-on-msg
+                           #:to-view app-to-view
+                           #:width 100
+                           #:height 30))
+  (test-program-press tp #\q)
+  (check-test-program-done tp))
