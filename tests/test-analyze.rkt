@@ -93,6 +93,13 @@
   ;; with at least one phase
   (check-regexp-match #rx"phase" output))
 
+(test-case/zo "print-analysis: zo shows provides and requires"
+  (define pf (parse-file zo-path))
+  (define output (with-output-to-string (lambda () (print-analysis pf))))
+  ;; zo-fixture.rkt provides greeting and requires racket/base
+  (check-regexp-match #rx"Provides:.*greeting" output)
+  (check-regexp-match #rx"Requires:.*racket/base" output))
+
 ;; -------------------------------------------------------------------
 ;; analyze-file convenience wrapper
 

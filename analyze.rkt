@@ -9,6 +9,7 @@
          racket/match
          racket/string
          compiler/zo-structs
+         compiler/decompile
          "parse.rkt")
 
 (provide analyze-file
@@ -182,12 +183,136 @@
     (print-chez-analysis (racket-boot-entry-boot entry))
     (newline)))
 
+;; -------------------------------------------------------------------
+;; Zo linklet decompilation helpers
+
+;; Search an S-expression tree for a #%machine-code form and return
+;; the byte-string length, or #f.
+(define (find-machine-code-size tree)
+  (cond
+    [(not (pair? tree)) #f]
+    [(and (eq? (car tree) '#%machine-code)
+          (pair? (cdr tree))
+          (bytes? (cadr tree)))
+     (bytes-length (cadr tree))]
+    [else (or (find-machine-code-size (car tree))
+              (find-machine-code-size (cdr tree)))]))
+
+;; Search for a source-location string like "/path/file.rkt:10:0"
+(define (find-source-loc tree)
+  (cond
+    [(string? tree) (and (regexp-match? #rx"\\.[a-z]+:" tree) tree)]
+    [(not (pair? tree)) #f]
+    [else (or (find-source-loc (car tree))
+              (find-source-loc (cdr tree)))]))
+
+;; Shorten a source location to just the filename + position.
+(define (short-source-loc loc)
+  (cond
+    [(not loc) #f]
+    [(regexp-match #rx"([^/]+\\.[a-z]+:[0-9]+:[0-9]+)$" loc) => cadr]
+    [else loc]))
+
+;; Extract (name code-size source-loc) triples from a decompiled form.
+(define (extract-defs form)
+  (cond
+    [(and (pair? form) (eq? (car form) 'define))
+     (define name (cadr form))
+     (define body (cddr form))
+     (define code-size (find-machine-code-size body))
+     (if code-size
+         (list (list (format "~a" name) code-size (short-source-loc (find-source-loc body))))
+         '())]
+    [(and (pair? form) (eq? (car form) 'define-values))
+     (define names (cadr form))
+     (define body (cddr form))
+     (define code-size (find-machine-code-size body))
+     (if code-size
+         (list (list (format "~a" names) code-size (short-source-loc (find-source-loc body))))
+         '())]
+    [else '()]))
+
+;; Collect all definitions from a decompiled linklet.
+(define (linklet-defs linklet-val)
+  (with-handlers ([exn:fail? (lambda (_) '())])
+    (define result (decompile linklet-val))
+    (if (list? result)
+        (apply append (map extract-defs result))
+        '())))
+
+;; Extract provide/require/define forms from a list of decompiled forms.
+(define (extract-provides+requires forms)
+  (define provides '())
+  (define requires '())
+  (when (list? forms)
+    (for ([form (in-list forms)])
+      (when (pair? form)
+        (cond
+          [(eq? (car form) 'provide)
+           (set! provides (append provides (cdr form)))]
+          [(eq? (car form) 'require)
+           (set! requires (append requires (cdr form)))]))))
+  (values provides requires))
+
+;; Print definition listing from a list of (name code-size source-loc phase) entries.
+(define (print-def-listing all-defs total-code-bytes)
+  (when (> total-code-bytes 0)
+    (printf "  total code: ~a\n" (format-bytes total-code-bytes)))
+  (define sorted (sort all-defs > #:key cadr))
+  (define top-n (take sorted (min 15 (length sorted))))
+  (when (pair? top-n)
+    (printf "  largest definitions:\n")
+    (for ([d (in-list top-n)])
+      (match-define (list name size loc phase) d)
+      (printf "    ~a  ~a~a~a\n"
+              (~a #:min-width 40 #:align 'left name)
+              (~a #:min-width 10 #:align 'right (format-bytes size))
+              (if loc (format "  ~a" loc) "")
+              (if (= phase 0) "" (format "  [phase ~a]" phase))))))
+
+;; Gather definitions from all phases in a bundle.
+(define (bundle-defs bundle)
+  (define tbl (linkl-bundle-table bundle))
+  (define phases (sort (filter integer? (hash-keys tbl)) <))
+  (define all-defs '())
+  (define total-code-bytes 0)
+  (for ([phase (in-list phases)])
+    (define v (hash-ref tbl phase))
+    (define defs (linklet-defs v))
+    (set! all-defs (append all-defs
+                           (map (lambda (d) (list (car d) (cadr d) (caddr d) phase))
+                                defs)))
+    (set! total-code-bytes (+ total-code-bytes (for/sum ([d (in-list defs)]) (cadr d)))))
+  (values all-defs total-code-bytes))
+
+;; Analyze one linklet bundle — print phases and top definitions.
+(define (print-bundle-analysis bundle)
+  (define tbl (linkl-bundle-table bundle))
+  (define phases (sort (filter integer? (hash-keys tbl)) <))
+  (define meta-keys (filter symbol? (hash-keys tbl)))
+
+  (printf "  phases: ~a ~a, ~a metadata key(s)\n"
+          (length phases)
+          (if (pair? phases) (format "~a" phases) "")
+          (length meta-keys))
+
+  (define-values (all-defs total-code-bytes) (bundle-defs bundle))
+  (print-def-listing all-defs total-code-bytes))
+
 (define (print-zo-analysis zo)
   (printf "Version: ~a\n" (zo-file-version zo))
   (printf "Machine: ~a\n" (zo-file-machine-type zo))
   (printf "Tag: ~a\n" (zo-file-tag zo))
 
   (define content (zo-file-content zo))
+
+  ;; Decompile the whole zo for top-level provide/require info.
+  (define top-forms
+    (and content
+         (with-handlers ([exn:fail? (lambda (_) #f)])
+           (define r (decompile content))
+           (and (list? r) r))))
+
   (cond
     [(not content) (printf "\n(zo-parse failed)\n")]
     [(linkl-directory? content)
@@ -195,31 +320,46 @@
      (define keys (hash-keys tbl))
      (printf "\nType: linklet directory\n")
      (printf "Modules: ~a\n" (length keys))
-     (for ([k (in-list (sort keys
-                             (lambda (a b)
-                               (cond
-                                 [(and (null? a) (null? b)) #f]
-                                 [(null? a) #t]
-                                 [(null? b) #f]
-                                 [else (string<? (format "~a" a) (format "~a" b))]))))])
+
+     ;; Show root module provides/requires from top-level decompile
+     (when top-forms
+       (define-values (provides requires) (extract-provides+requires top-forms))
+       (when (pair? requires)
+         (printf "Requires: ~a\n" (string-join (map (lambda (e) (format "~a" e)) requires) " ")))
+       (when (pair? provides)
+         (printf "Provides: ~a\n" (string-join (map (lambda (e) (format "~a" e)) provides) " "))))
+
+     (define sorted-keys
+       (sort keys (lambda (a b)
+                    (cond
+                      [(and (null? a) (null? b)) #f]
+                      [(null? a) #t]
+                      [(null? b) #f]
+                      [else (string<? (format "~a" a) (format "~a" b))]))))
+     (for ([k (in-list sorted-keys)])
        (define bundle (hash-ref tbl k))
-       (define phases (sort (filter integer? (hash-keys (linkl-bundle-table bundle))) <))
-       (define meta-keys (filter symbol? (hash-keys (linkl-bundle-table bundle))))
-       (printf "  ~a: ~a phase(s) ~a, ~a metadata key(s)\n"
-               k
-               (length phases)
-               (if (pair? phases) (format "~a" phases) "")
-               (length meta-keys)))]
+       (printf "\n--- module ~a ---\n" (if (null? k) "(root)" k))
+       (print-bundle-analysis bundle))]
     [(linkl-bundle? content)
-     (define tbl (linkl-bundle-table content))
-     (define phases (sort (filter integer? (hash-keys tbl)) <))
-     (define meta-keys (filter symbol? (hash-keys tbl)))
      (printf "\nType: linklet bundle\n")
-     (printf "Phases: ~a ~a\n" (length phases) (if (pair? phases) (format "~a" phases) ""))
-     (printf "Metadata keys: ~a ~a\n" (length meta-keys)
-             (if (pair? meta-keys) (format "~a" meta-keys) ""))]
+     (when top-forms
+       (define-values (provides requires) (extract-provides+requires top-forms))
+       (when (pair? requires)
+         (printf "Requires: ~a\n" (string-join (map (lambda (e) (format "~a" e)) requires) " ")))
+       (when (pair? provides)
+         (printf "Provides: ~a\n" (string-join (map (lambda (e) (format "~a" e)) provides) " "))))
+     (print-bundle-analysis content)]
     [(linkl? content)
-     (printf "\nType: single linklet\n")]
+     (printf "\nType: single linklet\n")
+     (define defs (linklet-defs content))
+     (when (pair? defs)
+       (define sorted (sort defs > #:key cadr))
+       (printf "\nDefinitions by code size:\n")
+       (for ([d (in-list sorted)])
+         (printf "  ~a  ~a~a\n"
+                 (~a #:min-width 40 #:align 'left (car d))
+                 (~a #:min-width 10 #:align 'right (format-bytes (cadr d)))
+                 (if (caddr d) (format "  ~a" (caddr d)) ""))))]
     [else
      (printf "\nType: unknown (~a)\n" content)]))
 
