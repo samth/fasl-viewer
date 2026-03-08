@@ -12,7 +12,8 @@
          "parse.rkt")
 
 (provide analyze-file
-         print-analysis)
+         print-analysis
+         format-bytes)
 
 ;; -------------------------------------------------------------------
 ;; Formatting helpers
