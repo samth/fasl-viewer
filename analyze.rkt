@@ -48,12 +48,20 @@
   (define top-n (take sorted (min limit (length sorted))))
   (when (pair? top-n)
     (printf "  ~a:\n" label)
+    (define top-n-total (for/sum ([d (in-list top-n)]) (cadr d)))
     (for ([d (in-list top-n)])
       (match-define (list name size detail) d)
-      (printf "    ~a  ~a~a\n"
+      (define pct (if (> total 0) (* 100.0 (/ size total)) 0))
+      (printf "    ~a  ~a  ~a~a\n"
               (~a #:min-width 40 #:align 'left name)
               (~a #:min-width 10 #:align 'right (format-bytes size))
-              (if detail (format "  ~a" detail) "")))))
+              (~a #:min-width 6 #:align 'right
+                  (format "~a%" (~r pct #:precision '(= 1))))
+              (if detail (format "  ~a" detail) "")))
+    (when (> total 0)
+      (define top-pct (~r (* 100.0 (/ top-n-total total)) #:precision '(= 1)))
+      (printf "  (top ~a: ~a of ~a, ~a%)\n"
+              (length top-n) (format-bytes top-n-total) (format-bytes total) top-pct))))
 
 ;; -------------------------------------------------------------------
 ;; Fasl object → items
